@@ -439,6 +439,57 @@ def test_originals_the_spine_has_no_live_depiction_for_are_orphans_not_failures(
     assert _sum(lines, "ReportMask", "stored") >= 1  # A's mask still lands
 
 
+def test_a_newer_copy_of_a_derived_original_never_replaces_the_one_the_spine_shows(
+    spine: dict[str, Any], world: dict[str, Any]
+) -> None:
+    """REPLAY-REDERIV: A2 (a capture behind A's copy) is derived with that
+    copy; media then mints a newer copy from A2, and A2 is depicted again on
+    another product. The real spine absorbs the newer copy (its registry is
+    write-once per original) and refuses its mask: ``kept_other``, exit 0,
+    and the read keeps sending the held copy and its mask on both products."""
+    db, a, pg, site = world["db"], world["a"], spine["pg"], world["site"]
+    images_of: Callable[[str], list[dict[str, Any]]] = spine["images_of"]
+    held_url, held_mask = f"{BASE}/{a['clean']}", f"{BASE}/{a['masks'][0]}"
+    code, lines = _replay(db, spine["url"])
+    assert code == rp.EXIT_DONE, lines
+
+    a2 = a["others"][0]
+    run = site.removeprefix("mmreport-")
+    newer = seed_copy(db, f"{run}-N", minted_by=a2, masks=(("mask-v1", "ok", f"{run}-mN"),))
+    ((again,),) = _q(pg, "INSERT INTO product (name_en) VALUES (%s) RETURNING id", f"{site} A2")
+    _q(
+        pg,
+        "INSERT INTO product_image (product_id, source_id, blob_sha256, role, position, "
+        "first_seen_at, last_seen_at) VALUES (%s, (SELECT id FROM source WHERE site = %s), "
+        "decode(%s, 'hex'), 'gallery', 0, now(), now())",
+        again,
+        site,
+        a2,
+    )
+    code, lines = _replay(db, spine["url"])
+    assert code == rp.EXIT_DONE, lines
+    assert _sum(lines, "ReportMask", "kept_other") == 1
+    assert _sum(lines, "ReportMask", "unregistered") == 0
+    assert any(
+        "different bytes" in w for b in lines if b["event"] == "batch" for w in b["warnings_sample"]
+    )
+    held = _q(
+        pg,
+        "SELECT encode(derivative_sha256, 'hex') FROM image WHERE origin_blob_sha256 = decode(%s, 'hex')",
+        a2,
+    )
+    assert held == [(a["clean"],)]  # the newer copy was never registered
+    for product in (str(again), world["pA"]):
+        shown = images_of(product)
+        assert shown and {i.get("url") for i in shown} == {held_url}, shown
+        assert all(i.get("mask", {}).get("url") == held_mask for i in shown), shown
+
+    code, lines = _replay(db, spine["url"])  # nothing pending: an orphan, still not a failure
+    assert code == rp.EXIT_DONE, lines
+    assert _sum(lines, "ReportMask", "orphan") == 1 and _sum(lines, "ReportMask", "kept_other") == 0
+    assert newer["clean"] not in json.dumps(images_of(str(again)))
+
+
 def test_a_caller_without_a_mesh_identity_is_refused_and_the_run_stops(
     spine: dict[str, Any], world: dict[str, Any]
 ) -> None:

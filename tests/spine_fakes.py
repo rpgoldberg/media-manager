@@ -23,6 +23,7 @@ from typing import Any
 import grpc
 from app.models import Image, ImageMask, ImageVersion, PublicObject, PublicObjectImage
 from app.spine.media_v1 import media_pb2, media_pb2_grpc
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 AT = dt.datetime(2026, 10, 14, 9, 0, tzinfo=dt.UTC)
@@ -37,6 +38,8 @@ class FakeSpine(media_pb2_grpc.SpineMediaServicer):
     depictions: dict[str, dict[str, Any]] = field(default_factory=dict)
     held: set[str] = field(default_factory=set)
     registry: set[bytes] = field(default_factory=set)
+    #: origin -> the derivative bytes first registered for it
+    by_origin: dict[bytes, bytes] = field(default_factory=dict)
     masks: dict[tuple[bytes, str], dict[str, Any]] = field(default_factory=dict)
     tombstones: dict[bytes, str] = field(default_factory=dict)
     #: Per RPC, what its next calls do: a status to abort with, or None to answer.
@@ -88,10 +91,25 @@ class FakeSpine(media_pb2_grpc.SpineMediaServicer):
         d = self.depictions.get(request.product_image_id)
         if d is None:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unknown product_image_id")
-        stored = request.derivative_sha256 not in self.registry
-        self.registry.add(request.derivative_sha256)
         d["state"] = "derived"
         self.held.discard(request.product_image_id)
+        # The registry's identity is the ORIGIN's (derivative-writer.ts): other
+        # bytes for an original already registered are absorbed, never stored.
+        first = self.by_origin.setdefault(d["origin"], request.derivative_sha256)
+        if first != request.derivative_sha256:
+            return media_pb2.DerivativeAck(
+                stored=False,
+                image_id=first.hex()[:8],
+                product_image_state="derived",
+                warnings=[
+                    f"a sanitized derivative at {request.pipeline_version} is already "
+                    f"registered for this original with different bytes ({first.hex()}); "
+                    f"the registered one stands and the reported "
+                    f"{request.derivative_sha256.hex()} is not registered"
+                ],
+            )
+        stored = request.derivative_sha256 not in self.registry
+        self.registry.add(request.derivative_sha256)
         return media_pb2.DerivativeAck(
             stored=stored,
             image_id=request.derivative_sha256.hex()[:8],
@@ -172,16 +190,23 @@ def seed_copy(
     deleted: bool = False,
     mime: str = "image/jpeg",
     own_grounding: dict[str, float] | None = None,
+    minted_by: str | None = None,
 ) -> dict[str, Any]:
     """One original (``sha('orig:'+tag)``), its clean copy (``sha('clean:'+tag)``)
     and its mask rows: ``(pipeline_version, status, mask tag)``, the mask's
     bytes ``sha('mask:'+mask tag)``. ``extra_originals`` are other captures
-    of the picture, linked behind the copy."""
-    origin = sha(f"orig:{tag}")
-    image = Image(sha256=origin, mime="image/jpeg", width=100, height=200, bytes=10)
-    if deleted:
-        image.deleted_at = AT
-    db.add(image)
+    of the picture, linked behind the copy. ``minted_by``: the sha of an
+    original already recorded (one linked behind another copy), which mints
+    this copy instead of a new original."""
+    if minted_by is None:
+        origin = sha(f"orig:{tag}")
+        image = Image(sha256=origin, mime="image/jpeg", width=100, height=200, bytes=10)
+        if deleted:
+            image.deleted_at = AT
+        db.add(image)
+    else:
+        origin = minted_by
+        image = db.execute(select(Image).where(Image.sha256 == minted_by)).scalar_one()
     db.flush()
     db.add(ImageVersion(image_id=image.id, version_no=1, storage_key=f"o/{origin}"))
     clean = sha(f"clean:{tag}")

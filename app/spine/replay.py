@@ -38,11 +38,16 @@ PER BATCH of at most 200 originals, in sha order:
   3. ReportMask for each published mask row of the copies whose LAST
      original is in this batch (so their derivatives have been reported).
      FAILED_PRECONDITION (no derivative registered for the copy): when this
-     run reported that derivative it is retried, and if it persists the mask
-     is ``unregistered`` (exit 1); when no original of the copy had a
-     depiction to lease (the spine never captured it, or it is suppressed)
-     it is an ``orphan``: expected, counted, the originals named in the
-     batch line, never a failure.
+     run's report STORED that derivative it is retried, and if it persists
+     the mask is ``unregistered`` (exit 1); when this run reported it and the
+     spine kept another derivative for each of those originals (stored=false:
+     its registry is write-once per original, fc-aggregation
+     derivative-writer.ts, so a copy minted after an original was derived
+     never replaces the one it shows) it is ``kept_other``: counted, never
+     retried, never a failure; when no original of the copy had a depiction
+     to lease (the spine never captured it, it is suppressed, or it is
+     already derived) it is an ``orphan``: expected, counted, the originals
+     named in the batch line, never a failure.
   4. A restore (WithdrawMask restore=true) for each published mask whose
      withdrawal this replay once sent (``spine_mask_withdrawals``).
   5. WithdrawMask for each withdrawn mask, recorded in
@@ -455,6 +460,8 @@ class _BatchReport:
     )
     states: Counter[str] = field(default_factory=Counter)
     unregistered: int = 0
+    #: masks of a copy the spine kept another derivative out for (stored=false)
+    kept_other: int = 0
     #: masks the spine would not take because no original of their copy had
     #: a depiction to lease, and those originals
     orphan_masks: int = 0
@@ -489,6 +496,7 @@ class _BatchReport:
             out[rpc] = {**c, "refused": dict(c["refused"])}
         out["ReportDerivative"]["states"] = dict(self.states)
         out["ReportMask"]["unregistered"] = self.unregistered
+        out["ReportMask"]["kept_other"] = self.kept_other
         out["ReportMask"]["orphan"] = self.orphan_masks
         return out
 
@@ -504,6 +512,7 @@ class _BatchReport:
         for name, n in self.local_refused.items():
             flat[f"local.refused.{name}"] += n
         flat["ReportMask.unregistered"] += self.unregistered
+        flat["ReportMask.kept_other"] += self.kept_other
         flat["ReportMask.orphan"] += self.orphan_masks
         flat["orphan"] += len(self.orphans)
         flat["leased"] += self.leased
@@ -523,9 +532,12 @@ class _Run:
     started: dt.datetime
     ledger: SpineReportRun | None
     owner: str
-    #: copies this run reported a derivative for and whose masks are not yet
-    #: due: dropped once they are, so the run holds no more as it passes
+    #: copies a report of this run STORED (the spine registered these bytes)
+    #: whose masks are not yet due: dropped once they are, so the run holds no
+    #: more as it passes
     landed: set[str] = field(default_factory=set)
+    #: copies this run reported OK, stored or not, whose masks are not yet due
+    reported: set[str] = field(default_factory=set)
     withdrawn_now: set[str] = field(default_factory=set)
 
     # ----- one call, counted -------------------------------------------------
@@ -559,13 +571,18 @@ class _Run:
 
     def _unlanded(self, report: _BatchReport, copy: str) -> None:
         """A mask the spine would not take: it has no derivative registered
-        for ``copy`` (FAILED_PRECONDITION). This run reported that derivative
-        (the call was retried): the mask never landed, ``unregistered``,
-        exit 1. Otherwise no original of the copy had a depiction to lease --
-        the spine never captured it, or it is suppressed -- and that is
-        expected: an ``orphan``, its originals named in the batch line."""
+        for ``copy`` (FAILED_PRECONDITION). A report of this run stored that
+        derivative (the call was retried): the mask never landed,
+        ``unregistered``, exit 1. This run reported it, never stored: the
+        spine kept the derivative it already holds for each of those
+        originals, ``kept_other``. Otherwise no original of the copy had a
+        depiction to lease -- the spine never captured it, it is suppressed,
+        or it is already derived -- and that is expected: an ``orphan``, its
+        originals named in the batch line."""
         if copy in self.landed:
             report.unregistered += 1
+        elif copy in self.reported:
+            report.kept_other += 1
         else:
             report.orphan_masks += 1
             report.orphans.update(self.plan.originals_of(copy))
@@ -662,7 +679,9 @@ class _Run:
             return
         report.rpc["ReportDerivative"]["stored"] += int(ack.stored)
         report.states[ack.product_image_state] += 1
-        self.landed.add(copy.sha256)  # an OK DERIVED report: the derivative is registered
+        self.reported.add(copy.sha256)
+        if ack.stored:  # this call registered these bytes; stored=false may be other bytes kept
+            self.landed.add(copy.sha256)
 
     def _report_masks(self, report: _BatchReport, copy: str) -> None:
         assert self.client is not None
@@ -743,6 +762,7 @@ class _Run:
             for copy in batch.copies_due:
                 self._report_masks(report, copy)
                 self.landed.discard(copy)  # its masks are due once per run: now
+                self.reported.discard(copy)
                 self._restores(report, copy)
                 self._withdrawals(report, copy)
         except _Stop as stop:

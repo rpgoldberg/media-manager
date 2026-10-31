@@ -30,11 +30,13 @@ spine's rpc.in lines are in that batch's trace. Every line carries run_id.
 
 Exit status: 0 done; 1 done, but something did not land in this run or an
 earlier attempt of it (a refusal, a value not sent, a mask with no public
-object, or a mask whose derivative this run reported and the spine still
-does not have); 2 bad arguments (nothing ran); 3 stopped, resumable: run it
-again (a spine that ignores the origin filter stops it too). A mask whose
-copy's originals the spine has no depiction for is an ``orphan`` (named in
-the batch line), not a failure.
+object, or a mask whose derivative a report of this run stored and the
+spine still does not have); 2 bad arguments (nothing ran); 3 stopped,
+resumable: run it again (a spine that ignores the origin filter stops it
+too). A mask whose copy's originals the spine has no depiction for is an
+``orphan`` (named in the batch line), and one whose copy the spine kept out
+for originals it already holds another copy for is ``kept_other``: neither
+is a failure.
 """
 
 from __future__ import annotations

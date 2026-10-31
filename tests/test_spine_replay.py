@@ -475,6 +475,70 @@ def test_a_derivative_landed_in_an_earlier_batch_still_makes_its_mask_unregister
     assert len(fake.sent("ReportMask")) == 2  # retried: the derivative had landed
 
 
+def _held_then_newer(db: Session, fake: FakeSpine, url: str) -> dict[str, Any]:
+    """REPLAY-REDERIV: original x, a capture behind copy ``held``, is derived
+    on the spine with ``held`` and its mask; then media mints a NEWER copy
+    from x, so the replay now maps x to it. The spine's registry is write-once
+    per original: it keeps ``held``."""
+    held = seed_copy(db, "held", extra_originals=("x",), masks=(("mask-v1", "ok", "m-held"),))
+    x = held["others"][0]
+    first = fake.depict(x)
+    code, _ = _run(db, url)
+    assert code == rp.EXIT_DONE and fake.published(held["masks"][0])
+    newer = seed_copy(db, "newer", minted_by=x, masks=(("mask-v1", "ok", "m-newer"),))
+    assert rp.load_plan(db, details=False).copy_of[x] == newer["clean"]
+    return {"x": x, "held": held, "newer": newer, "first": first}
+
+
+def _newer_masks_sent(fake: FakeSpine, newer: dict[str, Any]) -> int:
+    return sum(
+        m.derivative_sha256 == bytes.fromhex(newer["clean"]) for m in fake.sent("ReportMask")
+    )
+
+
+def test_a_newer_copy_the_spine_keeps_out_for_a_new_depiction_is_not_a_failure(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    """A NEW depiction of x is leased: its report of the newer copy is absorbed
+    (stored=false, warned: the held copy stands), so that copy's mask cannot
+    land. Not ``unregistered`` (exit 1) and never retried: ``kept_other``."""
+    fake, url = spine
+    s = _held_then_newer(db_session, fake, url)
+    second = fake.depict(s["x"])  # the same original on another product
+    code, lines = _run(db_session, url, attempts=5)
+    assert code == rp.EXIT_DONE, lines
+    assert fake.depictions[second]["state"] == "derived"
+    assert fake.by_origin[bytes.fromhex(s["x"])] == bytes.fromhex(s["held"]["clean"])
+    assert fake.published(s["held"]["masks"][0]) and not fake.published(s["newer"]["masks"][0])
+    assert _newer_masks_sent(fake, s["newer"]) == 1  # not retried: its derivative never landed
+    assert _total(lines, "ReportDerivative", "warnings") == 1
+    assert _total(lines, "ReportMask", "kept_other") == 1
+    assert _total(lines, "ReportMask", "unregistered") == 0
+    assert _total(lines, "ReportMask", "orphan") == 0
+    assert all(b["orphans"] == [] for b in _batches(lines))
+    counts = lines[-1]["counts"]
+    assert counts["ReportMask.kept_other"] == 1 and "ReportMask.unregistered" not in counts
+
+
+def test_a_newer_copy_of_an_original_already_derived_is_an_orphan_and_nothing_flips(
+    db_session: Session, spine: tuple[FakeSpine, str]
+) -> None:
+    """No depiction of x is pending (the prod shape, 10-31): nothing is
+    leased or reported for it, the newer copy's mask is refused as an orphan
+    (never a failure, never a stop), and the spine keeps showing the held copy
+    with its mask."""
+    fake, url = spine
+    s = _held_then_newer(db_session, fake, url)
+    code, lines = _run(db_session, url, attempts=5)
+    assert code == rp.EXIT_DONE, lines
+    assert _total(lines, "ReportDerivative", "calls") == 0
+    assert _newer_masks_sent(fake, s["newer"]) == 1
+    assert _total(lines, "ReportMask", "orphan") == 1
+    assert sorted(o for b in _batches(lines) for o in b["orphans"]) == [s["x"]]
+    assert fake.depictions[s["first"]]["state"] == "derived"
+    assert fake.published(s["held"]["masks"][0])
+
+
 def test_a_refused_report_is_counted_by_status_and_the_run_ends_1(
     db_session: Session, spine: tuple[FakeSpine, str]
 ) -> None:
