@@ -53,6 +53,10 @@ class ImageLimitError(ValueError):
         super().__init__(message)
         self.code = code
 
+    def __reduce__(self) -> tuple[type[ImageLimitError], tuple[str, str]]:
+        # its code and message across processes (MASK5: a CPU worker raises it)
+        return type(self), (self.code, str(self))
+
 
 @dataclass(frozen=True)
 class Limits:
