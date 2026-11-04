@@ -2612,6 +2612,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--cpu-workers",
         type=_whole(0, MAX_CPU_WORKERS),
+        metavar="N",
         help=(
             "worker processes for the pipeline's decodes, encodes and mask judgments (0: on "
             "the workers' threads; default the host's CPUs less two, at most writers + "

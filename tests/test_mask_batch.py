@@ -3899,6 +3899,19 @@ def test_a_bad_cpu_workers_is_refused_by_the_parser(
     assert "argument --cpu-workers" in err and why in err
 
 
+def test_the_help_names_the_cpu_workers_as_the_usage_does(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The MASK5 challenge (SHOULD-3): APPLY's read-back of a new image
+    greps its help for ``--cpu-workers N``, the module's usage line's
+    spelling; argparse otherwise prints ``--cpu-workers CPU_WORKERS``."""
+    with pytest.raises(SystemExit):
+        mb.main(["run", "--help"])
+    out = capsys.readouterr().out
+    assert "[--cpu-workers N]" in (mb.__doc__ or "")
+    assert "--cpu-workers N" in out and "CPU_WORKERS" not in out
+
+
 def test_main_runs_the_cpu_stages_on_the_workers_it_is_given_or_sized_to_the_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
