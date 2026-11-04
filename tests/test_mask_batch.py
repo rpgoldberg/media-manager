@@ -3751,6 +3751,41 @@ def test_a_database_outage_is_named_the_database_and_the_first_cause_is_kept(
     assert line["last_success_blob_sha256"] is None
 
 
+def test_a_new_streak_names_its_own_first_outage_not_the_last_streaks(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The MASK5 challenge (SHOULD-4): an image that gets through ends the
+    streak; the next streak's cause and counts are its own (the raw bucket
+    dropped before, the database now)."""
+    from sqlalchemy.exc import OperationalError
+
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(1, 6)]
+    bucket.down = {items[0].storage_key}
+    real = mb.original_settled
+    later = {i.blob_sha256 for i in items[2:]}
+
+    def tunnel_gone(db: Session, sha: str, **kw: Any) -> str | None:
+        if sha in later:
+            raise OperationalError("SELECT", {}, Exception("server closed the connection"))
+        return real(db, sha, **kw)
+
+    monkeypatch.setattr(mb, "original_settled", tunnel_gone)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=3), rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_blob_sha256"]) == (
+        "OperationalError",
+        "database",
+        items[2].blob_sha256,
+    )
+    assert line["streak_causes"] == {"database:OperationalError": 3}
+    assert line["last_success_blob_sha256"] == items[1].blob_sha256
+
+
 def test_a_media_bucket_outage_the_lane_caught_is_named_the_media_bucket(
     db_session: Session, tmp_path: Path
 ) -> None:

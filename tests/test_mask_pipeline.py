@@ -2220,6 +2220,99 @@ def test_the_pipelines_cpu_stages_are_calls_on_its_cpu_stages(tmp_path: Path) ->
     assert stages.calls == [("picture_digest", 100 * H)]
 
 
+class _SeedFlags(_Recording):
+    """The CPU stages inline, each claim's ``seed_inputs`` flags noted:
+    (its clean copy, its perceptual hash)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flags: list[tuple[bool, bool]] = []
+
+    def run(self, fn: Callable[..., Any], *args: Any, pixels: int | None = None) -> Any:
+        if fn.__name__ == "seed_inputs":
+            with self.lock:
+                self.flags.append((args[2], args[3]))
+        return super().run(fn, *args, pixels=pixels)
+
+
+def _phashes(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    """Every perceptual hash computed, by the bytes it was computed of."""
+    made: list[bytes] = []
+    real = mask_seed.compute_phash
+
+    def phash(data: bytes) -> str:
+        made.append(data)
+        return real(data)
+
+    monkeypatch.setattr(mask_seed, "compute_phash", phash)
+    return made
+
+
+def test_the_claim_hashes_an_original_only_when_it_is_not_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SHOULD-1's other half (the MASK5 challenge, SHOULD-4): the claim
+    computes the perceptual hash of an original the database has not
+    recorded, never of one it has (a user's upload, recorded with no copy
+    yet: its copy is still encoded), and the seed takes the hash the claim
+    computed: one hash in all, of the new original."""
+    raw = _Raw(tmp_path / "raw")
+    engine = _engine(tmp_path / "media.db")
+    new, recorded = raw.add(100, 1), raw.add(104, 2)
+    with Session(engine) as db:
+        db.add(ImageModel(sha256=recorded.blob_sha256, storage_key="uploads/x.png"))
+        db.commit()
+    phashed = _phashes(monkeypatch)
+    stages = _SeedFlags()
+    config = mb.BatchConfig(chunk_size=2, writers=2)
+    outcome = _run(tmp_path, "run", [new, recorded], raw, config, cpu=stages, engine=engine)
+    assert _statuses(outcome) == ["ok", "ok"]
+    assert sorted(stages.flags) == [(True, False), (True, True)]  # recorded: no hash
+    assert [hashlib.sha256(data).hexdigest() for data in phashed] == [new.blob_sha256]
+
+
+def test_a_seed_takes_the_perceptual_hash_its_inputs_carry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = _photo(100, 3)
+    phashed = _phashes(monkeypatch)
+    inputs = mask_seed.SeedInputs(digest=mask_seed.pixel_digest(data), phash="feedfacecafebeef")
+    engine = _engine(tmp_path / "media.db")
+    with Session(engine, expire_on_commit=False) as db:
+        seed_clean_image(
+            db, LocalObjectStore(tmp_path / "media"), data,
+            origins=[ImageOrigin(url=ITEM.format(n=3))], figure_id="f3", inputs=inputs,
+        )  # fmt: skip
+        db.commit()
+        sha = hashlib.sha256(data).hexdigest()
+        row = db.execute(select(ImageModel).where(ImageModel.sha256 == sha)).scalar_one()
+        assert row.phash == "feedfacecafebeef"
+    assert phashed == []
+    engine.dispose()
+
+
+class _Closing(_GivenUpOn):
+    """``_GivenUpOn``, its closes counted."""
+
+    closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.parametrize(("ends", "exit_status"), [("done", 0), ("circuit", 3)])
+def test_the_batch_lets_its_cpu_workers_go_when_it_ends(
+    tmp_path: Path, ends: str, exit_status: int
+) -> None:
+    """The MASK5 challenge (SHOULD-4): a run that never closed its pool
+    would leave its workers behind it, however it ended."""
+    raw = _Raw(tmp_path / "raw")
+    stages = _Closing("picture_digest", 104 * H if ends == "circuit" else 0)  # 0: never
+    config = mb.BatchConfig(chunk_size=1, writers=1, max_consecutive_failures=1)
+    outcome = _run(tmp_path, "run", [raw.add(104, 2)], raw, config, cpu=stages)
+    assert (outcome["exit"], stages.closed) == (exit_status, 1)
+
+
 def test_without_cpu_workers_the_mask_is_judged_where_its_copy_was_decoded(
     tmp_path: Path,
 ) -> None:
