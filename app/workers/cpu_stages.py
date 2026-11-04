@@ -35,11 +35,12 @@ at a time, and ``--cpu-workers 0``).
 - A WORKER THAT DIES (the OOM killer, a crash in a decoder) breaks the
   pool, and every call in flight on it fails; whose worker died is not
   told. The pool is replaced (each replacement reported: ``on_replaced``).
-  A call broken beside others is not charged for it: it runs again alone,
-  holding every unit, before any later call. A call broken alone is
-  charged, and its ``ATTEMPTS``-th such break is raised
-  (``BrokenProcessPool``). So a call that kills its worker spends its own
-  tries, never another call's (the MASK5 challenge, SHOULD-2).
+  A call that held part of the budget (others may have run beside it) is
+  not charged for the break: it runs again alone, holding every unit,
+  before any later call. A call that held every unit ran alone, so the
+  break is its own: it is charged, and its ``ATTEMPTS``-th such break is
+  raised (``BrokenProcessPool``). So a call that kills its worker spends
+  its own tries, never another call's (the MASK5 challenge, SHOULD-2).
 """
 
 from __future__ import annotations
@@ -91,7 +92,8 @@ MAX_CPU_WORKERS = 16
 #: post-processing) and the pipeline's own threads.
 RESERVED_CPUS = 2
 #: The breaks a call is charged before its BrokenProcessPool is raised: each
-#: one alone on the pool (a break beside other calls is not charged).
+#: one while it held every unit, alone on the pool (a break while it held
+#: part of the budget is not charged).
 ATTEMPTS = 3
 #: The modules whose functions the workers run, imported once by the fork
 #: server (a caller adds its own main module's: ``ProcessStages(preload=)``).
@@ -276,7 +278,7 @@ class ProcessStages(CpuStages):
                 except BrokenProcessPool as exc:
                     self._replace(executor, exc)
                     if units < self._budget:
-                        # beside others: not charged; again alone, by its ticket first
+                        # others may have run beside it: not charged; again alone, its ticket first
                         self._units.release(units)
                         units = 0
                         self._units.acquire(ticket, self._budget)
