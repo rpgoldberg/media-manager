@@ -28,13 +28,18 @@ at a time, and ``--cpu-workers 0``).
   once stay bounded whatever the pictures' sizes. The callers are the
   pipeline's threads, each waiting for its own call, so at most writers +
   prefetch calls queue, each holding only the bytes its thread holds anyway.
-- A WORKER THAT DIES (the kernel's OOM killer, a crash in a decoder) breaks
-  the pool: it is replaced and the call tried again, ``ATTEMPTS`` times in
-  all, each replacement reported (``on_replaced``).
+- THE OOM KILLER TAKES A WORKER. A cgroup OOM kills the process with the
+  highest score, which would be the driver (it holds the model) and with it
+  the batch; each worker raises its own score to the most
+  (``WORKER_OOM_SCORE_ADJ``), so the kernel takes a worker instead.
+- A WORKER THAT DIES (the OOM killer, a crash in a decoder) breaks the
+  pool: it is replaced and the call tried again, ``ATTEMPTS`` times in all,
+  each replacement reported (``on_replaced``).
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import gc
 import itertools
@@ -47,6 +52,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import forkserver
+from pathlib import Path
 from typing import Any, TypeVar
 
 from .mask_pipeline import Slots
@@ -84,6 +90,16 @@ ATTEMPTS = 3
 #: The modules whose functions the workers run, imported once by the fork
 #: server (a caller adds its own main module's: ``ProcessStages(preload=)``).
 PRELOAD = ("app.workers.mask_seed", "app.workers.mask")
+
+
+#: A process's own OOM score adjustment, and a worker's (MASK5 challenge,
+#: SHOULD-1): the most, so a cgroup OOM kills a worker, never the driver,
+#: which holds the model and is otherwise the biggest process. Raising one's
+#: own needs no privilege. Measured in a 2g container with the driver the
+#: bigger (as in prod): without it the driver was killed (exit 137); with it
+#: the worker was, the pool was replaced and the driver lived.
+OOM_SCORE_ADJ_PATH = Path("/proc/self/oom_score_adj")
+WORKER_OOM_SCORE_ADJ = 1000
 
 
 #: The numeric libraries' own thread pools in a worker: one thread each (the
@@ -142,8 +158,11 @@ def _worker_start() -> None:
     fork server are frozen out of its collections, which would otherwise
     walk them and so copy their pages (measured, MASK5: with each call's
     memory given back too, the 16 workers' memory peaked ~500 MiB lower
-    and sat ~750 MiB lower idle on the bench)."""
+    and sat ~750 MiB lower idle on the bench). Its OOM score is raised to
+    the most (``WORKER_OOM_SCORE_ADJ``); nothing where /proc has none."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    with contextlib.suppress(OSError):
+        OOM_SCORE_ADJ_PATH.write_text(str(WORKER_OOM_SCORE_ADJ))
     gc.freeze()
 
 

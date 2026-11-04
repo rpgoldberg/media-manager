@@ -214,6 +214,24 @@ def test_a_worker_ignores_an_interrupt_the_driver_decides_when_to_stop(
     assert two.run(_interrupt_handler) == repr(signal.SIG_IGN)
 
 
+def _oom_score_adj() -> str:
+    return Path("/proc/self/oom_score_adj").read_text().strip()
+
+
+@pytest.mark.skipif(not Path("/proc/self/oom_score_adj").exists(), reason="Linux's /proc")
+def test_a_worker_is_the_oom_killers_first_choice_and_the_driver_keeps_its_own(
+    two: cs.ProcessStages,
+) -> None:
+    """The MASK5 challenge (SHOULD-1): a cgroup OOM kills the process with
+    the highest score, which was the driver (it holds the model; 8.26 GB
+    once) and so the whole batch (exit 137). A worker raises its own score
+    to the most (no privilege needed), so the kernel takes a worker, the
+    pool replaces it and the driver lives; the driver's own is untouched."""
+    own = _oom_score_adj()
+    assert two.run(_oom_score_adj) == "1000"
+    assert _oom_score_adj() == own
+
+
 def _threads() -> tuple[str | None, int]:
     from pathlib import Path
 
@@ -312,13 +330,26 @@ def test_a_call_whose_exception_cannot_cross_raises_it_by_name() -> None:
 
 
 def test_a_workers_start_ignores_interrupts_and_freezes_what_it_shares(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     done: list[object] = []
     monkeypatch.setattr(cs.signal, "signal", lambda sig, handler: done.append((sig, handler)))
     monkeypatch.setattr(cs.gc, "freeze", lambda: done.append("freeze"))
+    adj = tmp_path / "oom_score_adj"  # never this test process's own
+    adj.write_text("0")
+    monkeypatch.setattr(cs, "OOM_SCORE_ADJ_PATH", adj)
     cs._worker_start()
     assert done == [(cs.signal.SIGINT, cs.signal.SIG_IGN), "freeze"]
+    assert adj.read_text() == "1000"
+
+
+def test_a_workers_start_goes_on_where_it_cannot_set_its_oom_score(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cs.signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(cs.gc, "freeze", lambda: None)
+    monkeypatch.setattr(cs, "OOM_SCORE_ADJ_PATH", tmp_path / "no-proc" / "oom_score_adj")
+    cs._worker_start()  # no /proc: nothing raised
 
 
 def test_a_pool_needs_a_worker() -> None:
