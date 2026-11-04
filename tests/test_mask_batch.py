@@ -3872,9 +3872,9 @@ def test_an_outage_is_named_by_its_class_first_then_by_its_stage(
 
 def test_any_outage_of_the_claims_cpu_stage_is_named_the_cpu_pool() -> None:
     """The MASK5 challenge (NOTE-4): what the claim's CPU stage raised is
-    the pool's, whatever its class (a fork server that could not start a
-    worker drops its connection: a ConnectionError), never the database's
-    or a bucket's."""
+    the pool's, whatever its class (an outage class included: the claim's
+    SQL failing is ``db``, never ``claim_keys``), never the database's or a
+    bucket's."""
     assert mb._connection("claim_keys", ConnectionError("fork server gone"), None) == "cpu_pool"
     assert mb._connection("claim_keys", cs.BrokenProcessPool("gone"), None) == "cpu_pool"
     assert mb._connection("settle", None, "BrokenProcessPool") == "cpu_pool"
