@@ -381,10 +381,16 @@ def _run(
     engine: Engine | None = None,
     faults: bool = False,
     cpu: cs.CpuStages | None = None,
+    progress: Path | None = None,
+    media: Path | None = None,
 ) -> dict[str, Any]:
-    """One batch on a fresh database and media bucket; everything it left."""
+    """One batch on a fresh database and media bucket; everything it left.
+    ``progress``, ``media``: a progress file and a media bucket another run
+    left (a rerun's), else its own."""
     root = tmp_path / name
     root.mkdir()
+    progress = progress or root / "progress.jsonl"
+    media = media or root / "media"
     engine = engine or _engine(root / "media.db")
     if faults:
         _faults(items, raw, engine)
@@ -398,15 +404,24 @@ def _run(
     main = Session(engine, expire_on_commit=False)  # autoflush on, as the sandbox's
     events: list[dict[str, Any]] = []
     try:
-        rt = _runtime(main, root, raw, backend or _Shapes(), events, cpu=cpu)
+        rt = _runtime(
+            main,
+            root,
+            raw,
+            backend or _Shapes(),
+            events,
+            cpu=cpu,
+            progress=mb.Progress(progress),
+            media=LocalObjectStore(media),
+        )
         code = mb.run_batch(items, config, rt)
     finally:
         main.close()
     outcome = {
         "exit": code,
         "tables": _canonical(engine),
-        "media": _media(root / "media"),
-        "progress": [_untimed(line) for line in _lines(root / "progress.jsonl")],
+        "media": _media(media),
+        "progress": [_untimed(line) for line in _lines(progress)],
         "events": [_untimed(e) for e in events],
         "batch_row": batch_row,
     }
@@ -2095,6 +2110,82 @@ def test_a_new_picture_is_encoded_once_and_a_picture_with_a_copy_never(
     second = _run(tmp_path, "again", [again], raw, config, engine=engine)
     assert _statuses(second) == ["already"]
     assert made == []
+
+
+class _GivenUpOn(_Recording):
+    """The CPU stages, the pool given up on for one picture at one stage
+    (its worker died under it alone ``ATTEMPTS`` times): that call raises
+    BrokenProcessPool."""
+
+    def __init__(self, name: str, pixels: int) -> None:
+        super().__init__()
+        self.name, self.pixels = name, pixels
+
+    def run(self, fn: Callable[..., Any], *args: Any, pixels: int | None = None) -> Any:
+        if fn.__name__ == self.name and pixels == self.pixels:
+            raise cs.BrokenProcessPool("A child process terminated abruptly")
+        return super().run(fn, *args, pixels=pixels)
+
+
+#: Each CPU stage's call, the reason its image is recorded with when the
+#: pool is given up on there, and the stage its outage is named by.
+_POOL_SITES = [
+    ("picture_digest", "claim_keys:BrokenProcessPool", "claim_keys"),  # read ahead
+    ("seed_inputs", "claim_keys:BrokenProcessPool", "claim_keys"),  # in its claim
+    ("judge_mask", "BrokenProcessPool", "settle"),  # after the model
+]
+
+
+@pytest.mark.parametrize(("site", "reason", "stage"), _POOL_SITES)
+def test_a_pool_given_up_on_interrupts_its_image_alone_and_a_rerun_takes_it(
+    tmp_path: Path, site: str, reason: str, stage: str
+) -> None:
+    """The MASK5 challenge (SHOULD-2): given up on in the read-ahead, the
+    pool stopped the whole batch; in the claim, its image was recorded
+    failed as a database fault ('db:'); in the judgment, a failed mask was
+    written and the image skipped until --retry-failed. A pool given up on
+    is the batch's own CPU workers failing, not known to be the image's
+    fault: the image is 'interrupted' (the circuit counts it, a plain
+    rerun takes it), its picture never decoded on the driver instead, and
+    the others go on."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1), raw.add(104, 2), raw.add(102, 3), raw.add(106, 4)]
+    engine = _engine(tmp_path / "media.db")
+    shared = {
+        "engine": engine,
+        "progress": tmp_path / "progress.jsonl",
+        "media": tmp_path / "media",
+    }
+    config = mb.BatchConfig(chunk_size=4, writers=2)
+    first = _run(tmp_path, "first", items, raw, config, cpu=_GivenUpOn(site, 104 * H), **shared)
+    records = {r["blob_sha256"]: r for r in first["progress"] if r["event"] == "item"}
+    poisoned = records.pop(items[1].blob_sha256)
+    assert (poisoned["status"], poisoned["reason"]) == ("interrupted", reason)
+    assert sorted(r["status"] for r in records.values()) == ["empty", "ok", "ok"]
+    assert first["exit"] == 1
+    # given up on before its seed, nothing of it is written (never seeded from a driver decode)
+    seeded = any(items[1].blob_sha256 in row for row in first["tables"]["images"])
+    assert seeded == (site == "judge_mask")
+    again = _run(tmp_path, "again", items, raw, config, cpu=_Recording(), **shared)
+    (rerun,) = (r for r in again["progress"][len(first["progress"]) :] if r["event"] == "item")
+    assert (rerun["blob_sha256"], rerun["status"]) == (items[1].blob_sha256, "ok")
+
+
+@pytest.mark.parametrize(("site", "reason", "stage"), _POOL_SITES)
+def test_a_pool_given_up_on_is_named_the_cpu_pool_when_the_circuit_opens(
+    tmp_path: Path, site: str, reason: str, stage: str
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    config = mb.BatchConfig(chunk_size=1, writers=1, max_consecutive_failures=1)
+    outcome = _run(tmp_path, "run", [raw.add(104, 2)], raw, config, cpu=_GivenUpOn(site, 104 * H))
+    assert outcome["exit"] == 3
+    (line,) = (e for e in outcome["events"] if e["event"] == "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_stage"]) == (
+        "BrokenProcessPool",
+        "cpu_pool",
+        stage,
+    )
+    assert line["streak_causes"] == {"cpu_pool:BrokenProcessPool": 1}
 
 
 def test_the_pipelines_cpu_stages_are_calls_on_its_cpu_stages(tmp_path: Path) -> None:

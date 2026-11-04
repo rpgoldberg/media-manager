@@ -32,10 +32,12 @@ refuses a write) and checked against its sha; the clean copy is seeded
 (``seed_clean_image``: original private, copy public) and its mask settled
 (``settle_clean_copy``) in the media database and bucket. A failure is that
 image's alone and is named (``fetch:<class>``, ``raw_hash_mismatch``,
-``unsupported_codec:<codec>``, ``seed:<class>``, ``settle:<class>``, or the
-lane's own reason). An OUTAGE-class failure (``is_outage``: a dropped
-connection, a timeout, the database's OperationalError, the bucket's 5xx) is
-recorded ``interrupted``: a plain rerun retries it (its failed media-db row
+``unsupported_codec:<codec>``, ``seed:<class>``, ``settle:<class>``,
+``claim_keys:<class>`` (its picture's keys on the CPU stages), or the lane's
+own reason). An OUTAGE-class failure (``is_outage``: a dropped connection, a
+timeout, the database's OperationalError, the bucket's 5xx; and the CPU
+stages' pool given up on, ``BrokenProcessPool``: MASK5) is recorded
+``interrupted``: a plain rerun retries it (its failed media-db row
 too), and ``--max-consecutive-failures`` of them in a row stop the batch. An
 image's OWN fault (its codec, its hash, NoSuchKey, an undecodable picture,
 the model's error) stays ``failed``: neither counted toward that streak nor
@@ -121,7 +123,11 @@ decoded pixels in them at once bounded by size), the same code on the same
 bytes; ``--cpu-workers 0``, and one image at a time, run it on the image's
 own thread. The default is the host's CPUs less two, at most ``--writers``
 + ``--prefetch`` and 16. A worker the pool replaced (one that died) is an
-``app.cpu_pool_replaced`` line.
+``app.cpu_pool_replaced`` line. A worker raises its own OOM score to the
+most, so a cgroup OOM kills a worker, not the driver. A call that kills its
+worker spends its own tries, never another call's; once given up on
+(``BrokenProcessPool``), its image is ``interrupted``, never decoded on the
+driver instead, and the batch goes on.
 
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
@@ -129,7 +135,7 @@ SIGTERM: the image in flight is finished first; pipelined, the images past
 the GPU are, the others are let go unrecorded and come back first). Before
 an exit 3 the ``app.circuit_open`` line says why (MASK5): the streak's first
 outage (``cause_exception``, ``cause_message``, ``cause_connection``:
-database, raw_bucket or media_bucket, ``cause_stage``, ``cause_blob_sha256``,
+database, raw_bucket, media_bucket or cpu_pool, ``cause_stage``, ``cause_blob_sha256``,
 ``cause_at``), its outages by connection and class (``streak_causes``), and
 the last image that got through (``last_success_chunk``,
 ``last_success_blob_sha256``, ``last_success_at``); job.end repeats its
@@ -183,6 +189,7 @@ from ..telemetry.tracing import NULL_ITEM, Item
 from ..workers.cpu_stages import (
     INLINE,
     MAX_CPU_WORKERS,
+    BrokenProcessPool,
     CpuStages,
     ProcessStages,
     default_cpu_workers,
@@ -1059,7 +1066,7 @@ def _mint(
     def raised(where: str, exc: Exception) -> dict[str, Any]:
         if isinstance(exc, ImageLimitError):  # the image's own fault, named by the limit it broke
             return failed(f"refused:{exc.code}")
-        return failed(f"{where}:{type(exc).__name__}", is_outage(exc), where, exc)
+        return failed(f"{where}:{type(exc).__name__}", _outage(exc), where, exc)
 
     def rolled_back(where: str, exc: Exception) -> dict[str, Any]:
         with timed(timings, "db"):  # a round trip like any query
@@ -1074,7 +1081,8 @@ def _mint(
         with timed(timings, "db"):  # the image's first query: the pool's checkout too
             settled = original_settled(db, item.blob_sha256, retry_failed=retry_failed)
     except Exception as exc:
-        return rolled_back("db", exc)
+        # its claim's CPU stage by its name (MASK5), never "db"
+        return rolled_back((lane.failed_stage if lane is not None else None) or "db", exc)
     if settled is not None:
         record.update(status="already", mask_status=settled)
         return record
@@ -1150,7 +1158,7 @@ def _mint(
     elif report.status == "failed":
         # the lane caught it and kept the class name; the bucket's error, if any, says more
         witnessed = media.error is not None and is_outage(media.error)
-        outage = is_outage_reason(report.reason) or witnessed
+        outage = _outage_reason(report.reason) or witnessed
         failed(str(report.reason), outage, "settle", media.error if witnessed else None)
     else:
         record.update(status=report.status, reason=report.reason, mask_sha256=report.mask_sha256)
@@ -1176,6 +1184,9 @@ class _Fetched:
     keys_seconds: float = 0.0
     #: its width x height from its header (None: it would not open)
     pixels: int | None = None
+    #: what its digest's call raised on the CPU stages (the pool given up
+    #: on): its claim raises it, so its image is recorded by it (MASK5)
+    cpu_error: Exception | None = None
 
 
 def _read_ahead(item: WorkItem, rt: Runtime, cpu: CpuStages = INLINE) -> _Fetched:
@@ -1194,17 +1205,23 @@ def _read_ahead(item: WorkItem, rt: Runtime, cpu: CpuStages = INLINE) -> _Fetche
         return _Fetched(error=exc, fetch_seconds=rt.monotonic() - start)
     fetched = rt.monotonic()
     digest = pixels = None
+    cpu_error: Exception | None = None
     if hashlib.sha256(data).hexdigest() == item.blob_sha256:
         with contextlib.suppress(Exception), PILImage.open(io.BytesIO(data)) as header:
             pixels = header.width * header.height
-        # a picture that will not decode (None) fails the seed before it writes a row
-        digest = cpu.run(picture_digest, data, pixels=pixels)
+        # a picture that will not decode (None) fails the seed before it writes a row;
+        # what the CPU stages raise is its claim's to raise: never the batch's
+        try:
+            digest = cpu.run(picture_digest, data, pixels=pixels)
+        except Exception as exc:
+            cpu_error = exc
     return _Fetched(
         data=data,
         digest=digest,
         fetch_seconds=fetched - start,
         keys_seconds=rt.monotonic() - fetched,
         pixels=pixels,
+        cpu_error=cpu_error,
     )
 
 
@@ -1340,6 +1357,8 @@ class _ImageLane:
         self.cpu = run.flow.cpu
         #: what its claim computed of its bytes for its seed (None: it will not decode)
         self.inputs: SeedInputs | None = None
+        #: the stage its claim failed in when not its SQL (``claim_keys``)
+        self.failed_stage: str | None = None
 
     def claim(self, db: Session) -> None:
         """Before the image's first query: read its footprint by its
@@ -1383,21 +1402,30 @@ class _ImageLane:
         """What the seed will need of the bytes and the database does not
         have: the clean copy when no copy of the picture is registered, the
         perceptual hash when the original is not recorded (nothing to
-        compute when both are); None when the picture will not decode."""
+        compute when both are); None when the picture will not decode.
+        What the CPU stages raised, read ahead or now, is raised as the
+        ``claim_keys`` stage's."""
         digest, data = self._fetched.digest, self._fetched.data
+        if self._fetched.cpu_error is not None:
+            self.failed_stage = "claim_keys"
+            raise self._fetched.cpu_error
         if digest is None or data is None:
             return None
         if near.copy_known and near.image_known:
             return SeedInputs(digest)
         with self._timings.stage("claim_keys"):
-            return self.cpu.run(
-                seed_inputs,
-                data,
-                digest,
-                not near.copy_known,
-                not near.image_known,
-                pixels=self._fetched.pixels,
-            )
+            try:
+                return self.cpu.run(
+                    seed_inputs,
+                    data,
+                    digest,
+                    not near.copy_known,
+                    not near.image_known,
+                    pixels=self._fetched.pixels,
+                )
+            except Exception:
+                self.failed_stage = "claim_keys"
+                raise
 
     def fetched(self) -> bytes:
         self._timings.add("fetch", self._fetched.fetch_seconds)
@@ -1700,18 +1728,39 @@ _DATABASE_REASONS = frozenset({"OperationalError", "InterfaceError", "IntegrityE
 def _connection(stage: str, exc: BaseException | None, reason: str | None) -> str:
     """Which connection an outage broke on: ``database`` (the media
     database, through the operator's tunnel), ``raw_bucket`` (the spine's
-    raw bucket the originals are read from) or ``media_bucket``. By the
-    exception's class first (the database driver's), then by the stage it
-    broke in: the original's read is the raw bucket's, a seed's or a
-    settle's other outage the media bucket's (their PUTs and GETs). With no
-    exception (the lane kept only a class name), by that name, else
-    ``unknown``. The batch reaches no spine API: its raw bucket is the
-    spine's."""
+    raw bucket the originals are read from), ``media_bucket``, or
+    ``cpu_pool`` (the batch's own CPU workers, given up on: MASK5). By the
+    exception's class first (the pool's, the database driver's), then by
+    the stage it broke in: the original's read is the raw bucket's, a
+    seed's or a settle's other outage the media bucket's (their PUTs and
+    GETs). With no exception (the lane kept only a class name), by that
+    name, else ``unknown``. The batch reaches no spine API: its raw bucket
+    is the spine's."""
+    if isinstance(exc, BrokenProcessPool) or (exc is None and reason == _POOL_GIVEN_UP):
+        return "cpu_pool"
     if exc is None:
         return "database" if reason in _DATABASE_REASONS else "unknown"
     if stage == "db" or type(exc).__module__.split(".")[0] in _DATABASE_MODULES:
         return "database"
     return "raw_bucket" if stage == "fetch" else "media_bucket"
+
+
+#: The class name the lane records of a call the CPU stages gave up on.
+_POOL_GIVEN_UP = BrokenProcessPool.__name__
+
+
+def _outage(exc: BaseException) -> bool:
+    """An outage (``is_outage``), or the CPU stages' pool given up on (MASK5
+    challenge, SHOULD-2: the call's worker died under it, alone, every try):
+    not known to be the image's fault (a crash in a decoder is; the OOM
+    killer taking a worker for the driver's memory is not), so its image is
+    ``interrupted`` (the circuit counts it, a plain rerun takes it)."""
+    return isinstance(exc, BrokenProcessPool) or is_outage(exc)
+
+
+def _outage_reason(reason: str | None) -> bool:
+    """``_outage`` of a failure the lane recorded by its class name alone."""
+    return reason == _POOL_GIVEN_UP or is_outage_reason(reason)
 
 
 def _outage_cause(
