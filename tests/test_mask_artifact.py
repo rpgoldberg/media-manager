@@ -19,6 +19,7 @@ import io
 
 import numpy as np
 import pytest
+from app.workers.cpu_stages import INLINE
 from app.workers.grounding import (
     ALPHA_THRESHOLD,
     AlphaGrounding,
@@ -593,3 +594,12 @@ class TestBuildMaskArtifact:
 
         with pytest.raises(ValueError, match="wrong"):
             build_mask_artifact(_studio_photo("PNG"), backend=_WrongSize())
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_a_mask_judged_on_the_cpu_stages_is_the_one_judged_in_place(fmt: str) -> None:
+    """MASK5: handed to the CPU stages after the model (the batch's worker
+    processes; inline here), the judgment answers what it answers in place."""
+    clean = _studio_photo(fmt)
+    in_place = build_mask_artifact(clean, backend=StubMattingBackend())
+    assert build_mask_artifact(clean, backend=StubMattingBackend(), cpu=INLINE) == in_place

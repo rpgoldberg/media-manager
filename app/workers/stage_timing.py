@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 STAGES = (
     "fetch",  # the original from the raw bucket, and its decode
     # pipelined, the claim (app.workers.mask_pipeline), told apart (MASKRATE):
-    # the image's picture keys (read ahead: decode, clean-copy encode, its decode),
+    # the image's picture keys: its pixel digest read ahead (its decode) and,
+    # for a picture with no copy yet, its clean copy encoded in its claim (MASK5),
     "claim_keys",
     # its footprint read but for the read's SQL ("db"): the ORM's own work,
     "claim_footprint",
@@ -96,6 +97,15 @@ class StageTimings:
         """``seconds`` measured elsewhere (a read-ahead thread) as ``name``:
         inside no stage of this image's, so carved out of none."""
         self.seconds[name] = self.seconds.get(name, 0.0) + seconds
+
+    def carve(self, name: str, seconds: float) -> None:
+        """``seconds`` of the open stage's spent as ``name`` elsewhere (MASK5:
+        a CPU worker process's part of its call, the mask's encode): counted
+        as ``name`` and carved out of that stage, as a nested stage is (the
+        nesting rule); with no stage open, added alone."""
+        self.seconds[name] = self.seconds.get(name, 0.0) + seconds
+        if self._inner:
+            self._inner[-1] += seconds
 
     def mark(self) -> Mark:
         """Now, for ``since``: the start of seconds two events bound rather

@@ -60,6 +60,7 @@ from app.workers.mask_seed import (
     picture_keys,
     seed_clean_image,
     seed_footprint,
+    seed_neighbourhood,
     seed_with_retry,
 )
 from app.workers.matting import StubMattingBackend
@@ -405,6 +406,33 @@ def test_a_photos_footprint_probes_every_table_it_reads(
     with pg() as db:
         statements = _captured(db.get_bind(), lambda: seed_footprint(db, **keys()))
     assert _walks(pg, statements, used) == []
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        # a picture with captures and copies linked (the loop turns until its fixed point)
+        lambda: {"sha": _sha("img:25"), "digest": _sha("px:25")},
+        # a new picture: nothing behind its keys
+        lambda: {"sha": _sha("new"), "digest": _sha("new-px")},
+        # a picture that will not decode: its byte sha alone
+        lambda: {"sha": _sha("img:50"), "digest": None},
+    ],
+    ids=["linked", "new", "no-digest"],
+)
+def test_a_photos_neighbourhood_probes_every_table_it_reads(
+    pg: sessionmaker[Session], keys: Callable[[], dict[str, Any]]
+) -> None:
+    """seed_neighbourhood (MASK5: the pipelined batch's claim, by the
+    original's sha and its digest): the same probes as its footprint, the
+    public objects' kind read beside their sha."""
+    used: set[str] = set()
+    with pg() as db:
+        statements = _captured(db.get_bind(), lambda: seed_neighbourhood(db, **keys()))
+    assert _walks(pg, statements, used) == []
+    with pg() as db:
+        near = seed_neighbourhood(db, sha=_sha("img:25"), digest=_sha("px:25"))
+        assert near.keys == seed_footprint(db, shas={_sha("img:25")}, digests={_sha("px:25")})
 
 
 # --------------------------------------------------------------------------

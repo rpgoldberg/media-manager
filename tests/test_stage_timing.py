@@ -624,3 +624,16 @@ def test_each_worker_thread_charges_its_own_image(tmp_path: Any) -> None:
     engine.dispose()
     assert seen["a"] == {"db": pytest.approx(2 * 0.0625 + 0.5)}
     assert seen["b"] == {"db": pytest.approx(6 * 0.0625 + 0.5)}
+
+
+def test_seconds_spent_elsewhere_inside_a_stage_are_carved_out_of_it() -> None:
+    """MASK5: a stage's work run in a CPU worker process reports a part of
+    it (the mask's encode) as its own stage: counted there once, and out of
+    the stage it ran inside, as a nested stage would be."""
+    clock = _Clock()
+    timings = StageTimings(clock)
+    with timings.stage("analysis"):
+        clock.now += 2.0  # the worker process's whole call
+        timings.carve("encode", 0.75)  # of which its encode
+    timings.carve("encode", 0.25)  # with no stage open: added alone
+    assert timings.seconds == {"analysis": 1.25, "encode": 1.0}

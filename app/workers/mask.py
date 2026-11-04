@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -54,6 +55,9 @@ from .grounding import (
 )
 from .matting import MattingBackend, get_matting_backend
 from .stage_timing import StageTimings, timed
+
+if TYPE_CHECKING:
+    from .cpu_stages import CpuStages
 
 #: Bump when the mask algorithm or its encoding changes: a new version mints
 #: new masks beside the old ones (an address cached on a phone never changes
@@ -218,7 +222,11 @@ def plain_appearance(clean: bytes) -> tuple[Appearance, AlphaGrounding | None]:
 
 
 def build_mask_artifact(
-    clean: bytes, *, backend: MattingBackend | None = None, timings: StageTimings | None = None
+    clean: bytes,
+    *,
+    backend: MattingBackend | None = None,
+    timings: StageTimings | None = None,
+    cpu: CpuStages | None = None,
 ) -> MaskOutcome:
     """Compute the mask, its grounding and both appearances for one clean
     image. Never alters ``clean``; never produces a cut-out. ``timings``, when
@@ -227,14 +235,18 @@ def build_mask_artifact(
     The image is read with its EXIF orientation applied, because that is how
     a browser draws the clean copy (``image-orientation: from-image``), and
     the mask must line up with what is drawn.
+
+    ``cpu`` (MASK5): where the judgment runs once the model answered -- the
+    grounding, both appearances and the mask's encode (``judge_mask``, the
+    same code on the same bytes): a CPU worker process of the pipelined
+    batch, which decodes ``clean`` again there, this thread's copy let go
+    first; the caller's thread when None.
     """
     active = backend or get_matting_backend()
     rgba = _oriented_rgba(clean)
     width, height = rgba.size
-
-    own_alpha_grounding = _own_grounding(rgba)
-    unmasked = _appearance(rgba)
-
+    # on this thread, the copy's own measures before the model, as ever
+    plain = _plain(rgba) if cpu is None else None
     answer = (
         active.predict_alpha(rgba) if timings is None else active.predict_alpha_timed(rgba, timings)
     )
@@ -243,6 +255,43 @@ def build_mask_artifact(
         raise ValueError(
             f"backend {active.name!r} answered {alpha.shape} for a {height}x{width} image"
         )
+    if cpu is None:
+        assert plain is not None
+        return _judged(rgba, alpha, active.name, timings, plain)
+    del rgba, answer  # the worker decodes its own: none held here meanwhile
+    outcome, encode_seconds = cpu.run(judge_mask, clean, alpha, active.name, pixels=width * height)
+    if timings is not None:
+        timings.carve("encode", encode_seconds)
+    return outcome
+
+
+def judge_mask(clean: bytes, alpha: np.ndarray, backend_name: str) -> tuple[MaskOutcome, float]:
+    """``build_mask_artifact``'s judgment of the model's ``alpha`` for
+    ``clean``, from the bytes (MASK5: in a CPU worker process), and the
+    seconds its mask's encode took."""
+    timings = StageTimings(time.monotonic)
+    rgba = _oriented_rgba(clean)
+    outcome = _judged(rgba, alpha, backend_name, timings, _plain(rgba))
+    return outcome, timings.seconds.get("encode", 0.0)
+
+
+def _plain(rgba: Image.Image) -> tuple[AlphaGrounding | None, Appearance]:
+    """The clean copy's own: the grounding of its alpha, its appearance."""
+    return _own_grounding(rgba), _appearance(rgba)
+
+
+def _judged(
+    rgba: Image.Image,
+    alpha: np.ndarray,
+    backend_name: str,
+    timings: StageTimings | None,
+    plain: tuple[AlphaGrounding | None, Appearance],
+) -> MaskOutcome:
+    """The model's ``alpha`` for the clean copy ``rgba`` judged, beside the
+    copy's own grounding and appearance (``plain``): the mask's grounding,
+    quality and encode, and the appearance with it applied."""
+    width, height = rgba.size
+    own_alpha_grounding, unmasked = plain
     grounding = measure_alpha_grounding(alpha)
     status, reason = assess_mask_quality(alpha, grounding)
 
@@ -250,7 +299,7 @@ def build_mask_artifact(
         return MaskOutcome(
             status=status,
             reason=reason,
-            backend=active.name,
+            backend=backend_name,
             pipeline_version=MASK_PIPELINE_VERSION,
             width=width,
             height=height,
@@ -267,7 +316,7 @@ def build_mask_artifact(
     return MaskOutcome(
         status=status,
         reason=reason,
-        backend=active.name,
+        backend=backend_name,
         pipeline_version=MASK_PIPELINE_VERSION,
         width=width,
         height=height,

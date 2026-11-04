@@ -1803,6 +1803,8 @@ def test_a_bad_run_option_is_refused_by_the_parser(
         ("--decode-slots", "8", "decode_slots", 8),
         ("--prefetch", "1", "prefetch", 1),
         ("--prefetch", "16", "prefetch", 16),
+        ("--cpu-workers", "0", "cpu_workers", 0),
+        ("--cpu-workers", "16", "cpu_workers", 16),
     ],
 )
 def test_the_smallest_sane_run_options_are_accepted(
@@ -3662,3 +3664,260 @@ def test_main_prints_the_stores_worklist(capsys: pytest.CaptureFixture[str]) -> 
     printed = capsys.readouterr().out
     assert "s.site IN ('amiami')" in printed and "'rank', 8" in printed
     assert mb.main(["sql", "stores-worklist", "--since", "nope"]) == 2
+
+
+# --------------------------------------------------------------------------
+# MASK5: why the circuit opened (exit 3), on its own line
+# --------------------------------------------------------------------------
+
+
+def test_the_circuit_open_line_names_the_outage_its_connection_and_the_last_success(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """Ross 11-03: the batch exits 3 on an outage several times a day and
+    nothing recorded why. The circuit_open line, written before the exit,
+    carries the streak's first outage (its exception's class and message,
+    the connection it broke on, the stage and the image), every outage of
+    the streak by connection and class, and the last image that got
+    through: its chunk, when, and which."""
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(1, 6)]
+    bucket.down = {i.storage_key for i in items[1:]}
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    config = mb.BatchConfig(chunk_size=2, max_consecutive_failures=3)
+    assert mb.run_batch(items, config, rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert line == {
+        "event": "circuit_open",
+        "consecutive_failures": 3,
+        "interrupted": 3,
+        "cause_exception": "ConnectionError",
+        "cause_message": "connection dropped",
+        "cause_connection": "raw_bucket",
+        "cause_stage": "fetch",
+        "cause_blob_sha256": items[1].blob_sha256,
+        "cause_at": "2026-10-14T15:30:00+00:00",
+        "streak_causes": {"raw_bucket:ConnectionError": 3},
+        "last_success_chunk": 1,
+        "last_success_blob_sha256": items[0].blob_sha256,
+        "last_success_at": "2026-10-14T15:30:00+00:00",
+    }
+    assert events[-1] is line  # the run's last line: it exits 3 right after
+    # the progress records are as ever: the cause rides on the line alone
+    progress = mb.Progress(tmp_path / "progress.jsonl").load()
+    assert all("cause" not in record for record in progress.values())
+
+
+def test_a_database_outage_is_named_the_database_and_the_first_cause_is_kept(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The streak's first outage is its cause (the database dropped), the
+    others are counted by connection and class; no image got through."""
+    from sqlalchemy.exc import OperationalError
+
+    raw = _Raw(tmp_path / "raw")
+    bucket = _Bucket(tmp_path / "raw")
+    raw.store = bucket
+    items = [raw.add(n) for n in range(1, 4)]
+    bucket.down = {i.storage_key for i in items[1:]}
+    real = mb.original_settled
+
+    def tunnel_gone(db: Session, sha: str, **kw: Any) -> str | None:
+        if sha == items[0].blob_sha256:
+            raise OperationalError(
+                "SELECT", {}, Exception("server closed the connection unexpectedly")
+            )
+        return real(db, sha, **kw)
+
+    monkeypatch.setattr(mb, "original_settled", tunnel_gone)
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=3), rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_stage"]) == (
+        "OperationalError",
+        "database",
+        "db",
+    )
+    assert "server closed the connection unexpectedly" in line["cause_message"]
+    assert line["streak_causes"] == {
+        "database:OperationalError": 1,
+        "raw_bucket:ConnectionError": 2,
+    }
+    assert (line["last_success_chunk"], line["last_success_at"]) == (None, None)
+    assert line["last_success_blob_sha256"] is None
+
+
+def test_a_media_bucket_outage_the_lane_caught_is_named_the_media_bucket(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """The lane keeps only the class; the bucket's own error, which the
+    driver saw, gives the message and the connection."""
+    raw = _Raw(tmp_path / "raw")
+    media = _Bucket5xx(tmp_path / "media")
+    media.reads_too = True  # the lane reads the seeded copy back: 503
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    rt.media_store = media
+    items = [raw.add(n) for n in range(2)]
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=2), rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_stage"]) == (
+        "ClientError",
+        "media_bucket",
+        "settle",
+    )
+    assert "ServiceUnavailable" in line["cause_message"]
+    assert line["streak_causes"] == {"media_bucket:ClientError": 2}
+
+
+def test_a_put_that_failed_in_the_seed_is_named_the_media_bucket(
+    db_session: Session, tmp_path: Path
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    media = _Bucket5xx(tmp_path / "media")
+    media.down = True  # every PUT: the seed's original first
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    rt.media_store = media
+    items = [raw.add(n) for n in range(2)]
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=2), rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_stage"]) == (
+        "ClientError",
+        "media_bucket",
+        "seed",
+    )
+
+
+def test_a_database_blip_the_lane_caught_is_named_by_its_class_alone(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lane recorded only the class name and no bucket error was seen:
+    the class still names the connection; there is no message to give."""
+    from sqlalchemy.exc import OperationalError
+
+    def blip(*a: object, **k: object) -> None:
+        raise OperationalError("INSERT", {}, Exception("server closed the connection"))
+
+    monkeypatch.setattr(mask_job, "register_public_object", blip)
+    raw = _Raw(tmp_path / "raw")
+    events: list[dict[str, Any]] = []
+    rt = _runtime(db_session, tmp_path, raw, events=events)
+    items = [raw.add(n) for n in range(2)]
+    assert mb.run_batch(items, mb.BatchConfig(max_consecutive_failures=2), rt) == 3
+    (line,) = _events(events, "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"], line["cause_stage"]) == (
+        "OperationalError",
+        "database",
+        "settle",
+    )
+    assert line["cause_message"] is None
+
+
+@pytest.mark.parametrize(
+    ("stage", "exc", "connection"),
+    [
+        ("db", ConnectionResetError("reset"), "database"),
+        ("fetch", TimeoutError("read timed out"), "raw_bucket"),
+        ("seed", TimeoutError("write timed out"), "media_bucket"),
+        ("settle", ConnectionError("gone"), "media_bucket"),
+        ("seed", None, "unknown"),
+    ],
+)
+def test_an_outage_is_named_by_its_class_first_then_by_its_stage(
+    stage: str, exc: BaseException | None, connection: str
+) -> None:
+    assert mb._connection(stage, exc, None) == connection
+
+
+def test_a_lane_reason_names_the_database_by_its_class_or_nothing() -> None:
+    assert mb._connection("settle", None, "InterfaceError") == "database"
+    assert mb._connection("settle", None, "ReadTimeoutError") == "unknown"
+
+
+def test_the_causes_message_is_one_bounded_line() -> None:
+    long = "connection to server at 10.0.0.1, port 5432 failed:\n" + "x" * 2000
+    cause = mb._outage_cause(
+        "db", ConnectionError(long), None, now=dt.datetime(2026, 11, 3, tzinfo=dt.UTC)
+    )
+    assert "\n" not in cause["message"]
+    assert len(cause["message"]) == mb.CAUSE_MESSAGE_MAX
+    assert cause["message"].startswith("connection to server at 10.0.0.1, port 5432 failed: x")
+
+
+def test_main_writes_why_the_circuit_opened_before_it_exits_3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On the run's own lines: app.circuit_open names the cause, and job.end
+    (exit 3) carries its scalars too."""
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(1, rank=0), raw.add(2, rank=0)]
+    bucket = _Bucket(tmp_path / "raw")
+    bucket.down = {i.storage_key for i in items}
+    wl = _worklist_file(tmp_path, items)
+    monkeypatch.setattr(mb, "build_backend", lambda args: _Model())
+    monkeypatch.setattr(mb, "_raw_store", lambda args, connections=10: mb.ReadOnlyStore(bucket))
+    argv = ["--sandbox", str(tmp_path / "sandbox"), "run", "--worklist", str(wl)]
+    argv += ["--progress", str(tmp_path / "p.jsonl"), "--device", "cpu", "--no-residential-check"]
+    argv += ["--busy-windows", "", "--max-consecutive-failures", "2", "--writers", "0"]
+    assert mb.main(argv) == 3
+    out = _stdout_events(capsys)
+    line = next(e for e in out if e["event"] == "circuit_open")
+    assert (line["cause_exception"], line["cause_connection"]) == ("ConnectionError", "raw_bucket")
+    assert line["cause_message"] == "connection dropped"
+    end = out[-1]
+    assert (end["event"], end["exit"]) == ("job.end", 3)
+    assert (end["cause_exception"], end["cause_connection"], end["cause_stage"]) == (
+        "ConnectionError",
+        "raw_bucket",
+        "fetch",
+    )
+
+
+# --------------------------------------------------------------------------
+# MASK5: --cpu-workers
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [("-1", "must be 0 or more"), ("17", "must be 16 or less"), ("many", "not a whole number")],
+)
+def test_a_bad_cpu_workers_is_refused_by_the_parser(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], value: str, why: str
+) -> None:
+    wl = _worklist_file(tmp_path, [])
+    argv = ["run", "--worklist", str(wl), "--no-residential-check", "--dry-run"]
+    with pytest.raises(SystemExit) as exc:
+        mb.main([*argv, "--cpu-workers", value])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "argument --cpu-workers" in err and why in err
+
+
+def test_main_runs_the_cpu_stages_on_the_workers_it_is_given_or_sized_to_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made: list[int] = []
+
+    def run_batch(items: list[mb.WorkItem], config: mb.BatchConfig, rt: mb.Runtime) -> int:
+        stages = rt.cpu_stages(config.cpu_workers)
+        made.append(stages.workers)
+        stages.close()
+        return 0
+
+    monkeypatch.setattr(mb, "run_batch", run_batch)
+    monkeypatch.setattr(mb.os, "sched_getaffinity", lambda _pid: set(range(24)))
+    wl = _worklist_file(tmp_path, [])
+    argv = ["--sandbox", str(tmp_path / "sb"), "run", "--worklist", str(wl), "--device", "cpu"]
+    argv += ["--no-residential-check", "--raw-dir", str(tmp_path / "raw")]
+    assert mb.main([*argv, "--writers", "16", "--prefetch", "2"]) == 0  # the host's: 16
+    assert mb.main([*argv, "--writers", "2", "--prefetch", "1"]) == 0  # no more than in flight
+    assert mb.main([*argv, "--cpu-workers", "3"]) == 0
+    assert mb.main([*argv, "--cpu-workers", "0"]) == 0  # on the workers' threads, as before
+    assert mb.main([*argv, "--writers", "0"]) == 0  # one image at a time: its own thread
+    assert made == [16, 3, 3, 0, 0]

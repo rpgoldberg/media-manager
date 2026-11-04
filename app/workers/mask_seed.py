@@ -113,6 +113,66 @@ def make_clean_copy(original: bytes) -> tuple[bytes, str, int, int]:
     return data, mime, picture.width, picture.height
 
 
+def picture_digest(original: bytes) -> str | None:
+    """``original``'s ``pixel_digest``, or None when its picture will not
+    decode (or a limit refuses it): the seed then fails before it writes a
+    row (MASK5: what the pipelined batch reads ahead, in a CPU worker)."""
+    try:
+        return pixel_digest(original)
+    except Exception:
+        return None
+
+
+class CleanCopy(NamedTuple):
+    """The clean copy ``seed_clean_image`` mints of an original: its bytes,
+    mime, sha, own pixel digest and size."""
+
+    data: bytes
+    mime: str
+    sha256: str
+    own_digest: str
+    width: int
+    height: int
+
+
+def clean_copy(original: bytes, picture: Image.Image | None = None) -> CleanCopy:
+    """``original``'s ``CleanCopy``, from its ``picture`` (``_picture``) when
+    the caller decoded it already."""
+    if picture is None:
+        picture = _picture(original)
+    data, mime = _encode(picture, original)
+    return CleanCopy(
+        data,
+        mime,
+        hashlib.sha256(data).hexdigest(),
+        pixel_digest(data),
+        picture.width,
+        picture.height,
+    )
+
+
+class SeedInputs(NamedTuple):
+    """What ``seed_clean_image`` computes from an original's bytes alone,
+    computed ahead (MASK5: the pipelined batch's claim, in a CPU worker): the
+    picture's pixel digest; its clean copy, when the claim found no copy of
+    the picture registered; its perceptual hash, when the claim found the
+    original not recorded. The seed computes whatever it needs and lacks."""
+
+    digest: str
+    clean: CleanCopy | None = None
+    phash: str | None = None
+
+
+def seed_inputs(original: bytes, digest: str, clean: bool, phash: bool) -> SeedInputs:
+    """``original``'s ``SeedInputs``: its clean copy only when ``clean``, its
+    perceptual hash only when ``phash``."""
+    return SeedInputs(
+        digest,
+        clean_copy(original) if clean else None,
+        compute_phash(original) if phash else None,
+    )
+
+
 def register_public_object(
     db: Session,
     *,
@@ -268,10 +328,43 @@ class PictureKeys(NamedTuple):
 
 def picture_keys(original: bytes) -> PictureKeys:
     """``original``'s ``PictureKeys``, computed exactly as the seed computes
-    them (MASK-PERF-2: the pipelined batch claims them before the seed)."""
+    them (the display-copy lane's claim, app.workers.display_copy)."""
     picture = _picture(original)
-    clean, _mime = _encode(picture, original)
-    return PictureKeys(_digest(picture), hashlib.sha256(clean).hexdigest(), pixel_digest(clean))
+    copy = clean_copy(original, picture)
+    return PictureKeys(_digest(picture), copy.sha256, copy.own_digest)
+
+
+class Neighbourhood(NamedTuple):
+    """An original's ``seed_footprint`` by its byte sha and pixel digest
+    (``keys``), and what the same read told: whether the original is
+    recorded (``image_known``) and whether a clean copy of its picture is
+    registered (``copy_known``: the copy ``seed_clean_image`` would link it
+    to, so it mints none)."""
+
+    keys: set[str]
+    image_known: bool
+    copy_known: bool
+
+
+def seed_neighbourhood(db: Session, *, sha: str, digest: str | None) -> Neighbourhood:
+    """MASK5 (SHOULD-1): the pipelined batch's claim, by the original's byte
+    ``sha`` and its picture's ``digest`` (None: it will not decode) alone --
+    the same statements ``seed_footprint`` makes of them, the public
+    objects' kind read beside their sha. A picture with no copy yet adds its
+    clean copy's keys after (``seed_footprint`` of them), once it is
+    encoded."""
+    digests = {digest} if digest is not None else set()
+    images = _shas_matching(
+        ImageModel.sha256, (ImageModel.sha256, {sha}), (ImageModel.pixel_sha256, digests), db=db
+    )
+    probes = [PublicObject.sha256 == sha]
+    if digest is not None:
+        probes += [PublicObject.pixel_sha256 == digest, PublicObject.own_pixel_sha256 == digest]
+    found = db.execute(select(PublicObject.sha256, PublicObject.kind).where(or_(*probes))).all()
+    objects = {obj for obj, _kind in found}
+    # the copies link_capture finds (_copies_showing): sanitized ones behind these keys
+    copy_known = any(kind == "sanitized" for _obj, kind in found)
+    return Neighbourhood({sha} | digests | _grown(db, images, objects), sha in images, copy_known)
 
 
 def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str]:
@@ -295,6 +388,12 @@ def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str
         (PublicObject.own_pixel_sha256, digests),
         db=db,
     )
+    return shas | digests | _grown(db, images, objects)
+
+
+def _grown(db: Session, images: set[str], objects: set[str]) -> set[str]:
+    """``images`` and ``objects`` (shas) grown through every capture-to-copy
+    link to their fixed point."""
     while images or objects:
         links = db.execute(_links(objects, images)).all()
         more_objects = {obj for obj, _image in links} - objects
@@ -303,7 +402,7 @@ def seed_footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str
             break
         objects |= more_objects
         images |= more_images
-    return shas | digests | images | objects
+    return images | objects
 
 
 def _shas_matching(
@@ -347,6 +446,7 @@ def seed_clean_image(
     *,
     origins: Sequence[ImageOrigin],
     figure_id: str,
+    inputs: SeedInputs | None = None,
 ) -> PublicObject:
     """Register ``original`` (stored, never public), its clean copy (public,
     kind ``sanitized``), the image as one behind that copy, and one gallery
@@ -366,7 +466,11 @@ def seed_clean_image(
     every clean copy of it (``public_object_images``), in whichever order
     they arrive, so each copy and its mask are judged over all of them: a
     soft delete or an ineligible origin under any capture -- the one whose
-    bytes ARE the copy included -- reaches every copy (app.publication)."""
+    bytes ARE the copy included -- reaches every copy (app.publication).
+
+    ``inputs`` (MASK5): what the caller computed of ``original`` ahead
+    (``seed_inputs``), used instead of computing it again; whatever the seed
+    needs and they lack it computes, the same values."""
     check_image(original)  # MM-CAPS-1: refused before anything is hashed, stored or decoded
     orig_sha = hashlib.sha256(original).hexdigest()
     image = db.execute(select(ImageModel).where(ImageModel.sha256 == orig_sha)).scalar_one_or_none()
@@ -378,7 +482,11 @@ def seed_clean_image(
         store.put(key, original, mime)
         image = ImageModel(
             sha256=orig_sha,
-            phash=compute_phash(original),
+            phash=(
+                inputs.phash
+                if inputs is not None and inputs.phash is not None
+                else compute_phash(original)
+            ),
             mime=mime,
             width=width,
             height=height,
@@ -403,16 +511,20 @@ def seed_clean_image(
         )
         db.flush()
 
-    picture = _picture(original)
-    digest = _digest(picture)
+    picture: Image.Image | None = None
+    if inputs is not None:
+        digest = inputs.digest
+    else:
+        picture = _picture(original)
+        digest = _digest(picture)
     copies = link_capture(db, image, digest)
     if copies:
         obj = copies[0]
     else:
-        clean, clean_mime = _encode(picture, original)
-        clean_sha = hashlib.sha256(clean).hexdigest()
-        own = pixel_digest(clean)
-        cw, ch = picture.width, picture.height
+        made = inputs.clean if inputs is not None and inputs.clean is not None else None
+        if made is None:
+            made = clean_copy(original, picture)
+        clean, clean_mime, clean_sha, own, cw, ch = made
         key = derived_key(clean_sha, clean_mime)
         store.put(key, clean, clean_mime)
         version = ImageVersion(

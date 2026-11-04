@@ -37,6 +37,7 @@ from app.cli import mask_batch as mb
 from app.models import Base, FigureGallery, ImageMask, ImageVersion, MaskBatch, PublicObject
 from app.models import Image as ImageModel
 from app.object_store import LocalObjectStore, derived_key
+from app.workers import cpu_stages as cs
 from app.workers import mask_job, mask_seed
 from app.workers import mask_pipeline as mp
 from app.workers.mask_policy import ImageOrigin
@@ -261,7 +262,9 @@ def _runtime(
     stop: Callable[[], bool] | None = None,
     gates: mb.Gates | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    cpu: cs.CpuStages | None = None,
 ) -> mb.Runtime:
+    stages = cpu or cs.INLINE
     return mb.Runtime(
         gates=gates or mb.Gates(windows=(), gpu=None, residential=None, now=lambda: NOON),
         open_db=lambda: main,
@@ -274,6 +277,7 @@ def _runtime(
         monotonic=time.monotonic,
         emit=events.append,
         stop_requested=stop or (lambda: False),
+        cpu_stages=lambda _workers: stages,
     )
 
 
@@ -376,6 +380,7 @@ def _run(
     backend: MattingBackend | None = None,
     engine: Engine | None = None,
     faults: bool = False,
+    cpu: cs.CpuStages | None = None,
 ) -> dict[str, Any]:
     """One batch on a fresh database and media bucket; everything it left."""
     root = tmp_path / name
@@ -393,7 +398,8 @@ def _run(
     main = Session(engine, expire_on_commit=False)  # autoflush on, as the sandbox's
     events: list[dict[str, Any]] = []
     try:
-        code = mb.run_batch(items, config, _runtime(main, root, raw, backend or _Shapes(), events))
+        rt = _runtime(main, root, raw, backend or _Shapes(), events, cpu=cpu)
+        code = mb.run_batch(items, config, rt)
     finally:
         main.close()
     outcome = {
@@ -1532,10 +1538,10 @@ def test_a_read_ahead_that_breaks_stops_the_batch(
     items = [raw.add(100 + n % 3 * 8, n) for n in range(1, 5)]
     real = mb._read_ahead
 
-    def read_ahead(item: mb.WorkItem, rt: mb.Runtime) -> Any:
+    def read_ahead(item: mb.WorkItem, rt: mb.Runtime, *cpu: Any) -> Any:
         if item is items[1]:
             raise MemoryError
-        return real(item, rt)
+        return real(item, rt, *cpu)
 
     monkeypatch.setattr(mb, "_read_ahead", read_ahead)
     with pytest.raises(MemoryError):
@@ -1691,14 +1697,14 @@ def test_the_claim_tells_its_keys_its_footprint_and_its_wait_for_earlier_images_
     monkeypatch.setattr(mb, "StageTimings", Capturing)
     raw = _Raw(tmp_path / "raw")
     items = [raw.add(100, n) for n in range(1, 4)]
-    real = mb.seed_footprint
+    real = mb.seed_neighbourhood
 
-    def footprint(db: Session, *, shas: set[str], digests: set[str]) -> set[str]:
-        if items[0].blob_sha256 in shas:
+    def footprint(db: Session, *, sha: str, digest: str | None) -> mask_seed.Neighbourhood:
+        if sha == items[0].blob_sha256:
             time.sleep(0.6)  # the first image's read, slow
-        return real(db, shas=shas, digests=digests)
+        return real(db, sha=sha, digest=digest)
 
-    monkeypatch.setattr(mb, "seed_footprint", footprint)
+    monkeypatch.setattr(mb, "seed_neighbourhood", footprint)
     root = tmp_path / "run"
     engine = _engine(tmp_path / "media.db")
     main = Session(engine, expire_on_commit=False)
@@ -2029,3 +2035,261 @@ def test_a_chunk_left_open_by_a_failure_still_ends(
         main.close()
         engine.dispose()
     assert ended == [True]
+
+
+# --------------------------------------------------------------------------
+# MASK5: the CPU stages on worker processes, and the keys read ahead (SHOULD-1)
+# --------------------------------------------------------------------------
+
+
+class _Recording(cs.CpuStages):
+    """The CPU stages inline, each call noted: its function and its pixels.
+    A pool's stand-in: with workers, the mask is judged on them."""
+
+    workers = 1
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.calls: list[tuple[str, int | None]] = []
+
+    def run(self, fn: Callable[..., Any], *args: Any, pixels: int | None = None) -> Any:
+        with self.lock:
+            self.calls.append((fn.__name__, pixels))
+        return fn(*args)
+
+
+def _encodes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every clean-copy encode, by the thread that made it."""
+    made: list[str] = []
+    real = mask_seed._encode
+
+    def encode(picture: Image.Image, original: bytes) -> tuple[bytes, str]:
+        made.append(threading.current_thread().name)
+        return real(picture, original)
+
+    monkeypatch.setattr(mask_seed, "_encode", encode)
+    return made
+
+
+def _statuses(outcome: dict[str, Any]) -> list[str]:
+    return [r["status"] for r in outcome["progress"] if r["event"] == "item"]
+
+
+def test_a_new_picture_is_encoded_once_and_a_picture_with_a_copy_never(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SHOULD-1 (the MASKRATE challenge): the read-ahead computes the
+    picture's pixel digest alone. The clean copy is encoded once, in the
+    image's claim, only when no copy of its picture is registered, and the
+    seed mints the copy from that encode; a picture with a copy is never
+    encoded."""
+    made = _encodes(monkeypatch)
+    raw = _Raw(tmp_path / "raw")
+    engine = _engine(tmp_path / "media.db")
+    config = mb.BatchConfig(chunk_size=1, writers=2)
+    first = _run(tmp_path, "first", [raw.add(100, 1)], raw, config, engine=engine)
+    assert _statuses(first) == ["ok"]
+    assert made == ["mask-image-0"]  # in its claim, on its worker: never read ahead
+    made.clear()
+    again = raw.add(100, 2, pixels_of=1)  # the same picture, other bytes: its copy is known
+    second = _run(tmp_path, "again", [again], raw, config, engine=engine)
+    assert _statuses(second) == ["already"]
+    assert made == []
+
+
+def test_the_pipelines_cpu_stages_are_calls_on_its_cpu_stages(tmp_path: Path) -> None:
+    """Read ahead: the picture's digest. In the claim: what the seed will
+    need and the database does not have (the clean copy of a new picture,
+    the perceptual hash of a new original), nothing when it has both. After
+    the model: the mask's judgment and its encode. Each sized by its
+    picture's pixels."""
+    stages = _Recording()
+    raw = _Raw(tmp_path / "raw")
+    engine = _engine(tmp_path / "media.db")
+    config = mb.BatchConfig(chunk_size=4, writers=2)
+    items = [
+        raw.add(100, 1),  # new: ok
+        raw.add(100, 2, pixels_of=1),  # a copy known, the original not: already
+        raw.add(102, 3),  # new: empty
+        raw.add(107, 4, url=PICTURE),  # new: ineligible, no model
+    ]
+    outcome = _run(tmp_path, "run", items, raw, config, cpu=stages, engine=engine)
+    assert sorted(_statuses(outcome)) == ["already", "empty", "ineligible", "ok"]  # as they end
+    assert sorted(stages.calls) == sorted(
+        [
+            *(("picture_digest", w * H) for w in (100, 100, 102, 107)),
+            *(("seed_inputs", w * H) for w in (100, 100, 102, 107)),
+            *(("judge_mask", w * H) for w in (100, 102)),
+        ]
+    )
+    stages.calls.clear()
+    rerun = raw.add(100, 1)  # the first original again, its progress gone: both known
+    outcome = _run(tmp_path, "rerun", [rerun], raw, config, cpu=stages, engine=engine)
+    assert _statuses(outcome) == ["already"]
+    assert stages.calls == [("picture_digest", 100 * H)]
+
+
+def test_without_cpu_workers_the_mask_is_judged_where_its_copy_was_decoded(
+    tmp_path: Path,
+) -> None:
+    """``--cpu-workers 0``, pipelined: the judgment stays on the image's
+    thread, on the copy decoded for the model, as before MASK5; it is never
+    handed to the inline stages, which would decode the copy a second time."""
+
+    class _Inline(_Recording):
+        workers = 0
+
+    stages = _Inline()
+    raw = _Raw(tmp_path / "raw")
+    items = [raw.add(100, 1), raw.add(102, 2)]
+    outcome = _run(tmp_path, "run", items, raw, mb.BatchConfig(chunk_size=2, writers=2), cpu=stages)
+    assert sorted(_statuses(outcome)) == ["empty", "ok"]
+    assert sorted(name for name, _ in stages.calls) == [
+        "picture_digest",
+        "picture_digest",
+        "seed_inputs",
+        "seed_inputs",
+    ]
+
+
+def test_the_pipeline_on_cpu_worker_processes_writes_what_one_image_at_a_time_writes(
+    tmp_path: Path,
+) -> None:
+    raw = _Raw(tmp_path / "raw")
+    items = _mixed(raw)
+    alone = _run(tmp_path, "alone", items, raw, mb.BatchConfig(chunk_size=4), faults=True)
+    stages = cs.ProcessStages(2)
+    try:
+        config = mb.BatchConfig(chunk_size=4, writers=4)
+        piped = _run(tmp_path, "piped", items, raw, config, faults=True, cpu=stages)
+    finally:
+        stages.close()
+    assert stages.replaced == 0
+    assert _unordered(piped) == _unordered(alone)
+
+
+def test_the_mask_encode_in_a_worker_process_is_its_own_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[StageTimings] = []
+
+    class Capturing(StageTimings):
+        def __init__(self, clock: Callable[[], float]) -> None:
+            super().__init__(clock)
+            captured.append(self)
+
+    monkeypatch.setattr(mb, "StageTimings", Capturing)
+    raw = _Raw(tmp_path / "raw")
+    stages = cs.ProcessStages(1)
+    try:
+        config = mb.BatchConfig(chunk_size=1, writers=1)
+        outcome = _run(tmp_path, "run", [raw.add(100, 1)], raw, config, cpu=stages)
+    finally:
+        stages.close()
+    assert _statuses(outcome) == ["ok"]
+    (seconds,) = (t.seconds for t in captured)
+    assert seconds["encode"] > 0 and seconds["analysis"] > 0 and seconds["claim_keys"] > 0
+
+
+def test_the_picture_digest_is_the_pixel_digest_or_none(tmp_path: Path) -> None:
+    one = _photo(100, 1)
+    assert mask_seed.picture_digest(one) == mask_seed.pixel_digest(one)
+    assert mask_seed.picture_digest(b"not a picture") is None
+
+
+def test_the_neighbourhood_tells_whether_the_original_and_a_copy_of_its_picture_are_known(
+    db_session: Session, tmp_path: Path
+) -> None:
+    store = LocalObjectStore(tmp_path / "media")
+    one, again = _photo(100, 1), _photo(100, 1, note="again")
+    sha = {d: hashlib.sha256(d).hexdigest() for d in (one, again)}
+    digest = mask_seed.pixel_digest(one)
+    near = mask_seed.seed_neighbourhood(db_session, sha=sha[one], digest=digest)
+    assert (near.image_known, near.copy_known, near.keys) == (False, False, {sha[one], digest})
+    seed_clean_image(
+        db_session, store, one, origins=[ImageOrigin(url=ITEM.format(n=1))], figure_id="f1"
+    )
+    near = mask_seed.seed_neighbourhood(db_session, sha=sha[one], digest=digest)
+    assert (near.image_known, near.copy_known) == (True, True)
+    assert near.keys == seed_footprint(db_session, shas={sha[one]}, digests={digest})
+    near = mask_seed.seed_neighbourhood(db_session, sha=sha[again], digest=digest)
+    assert (near.image_known, near.copy_known) == (False, True)
+    assert sha[one] in near.keys
+    # a picture that will not decode: its byte sha alone
+    near = mask_seed.seed_neighbourhood(db_session, sha="f" * 64, digest=None)
+    assert (near.image_known, near.copy_known, near.keys) == (False, False, {"f" * 64})
+
+
+def test_an_original_whose_bytes_are_a_mask_has_no_copy_of_its_picture_yet(
+    db_session: Session, tmp_path: Path
+) -> None:
+    """Only a SANITIZED object behind its sha or digests is a copy the seed
+    links to (``_copies_showing``); a mask with its bytes is not."""
+    store = LocalObjectStore(tmp_path / "media")
+    data = _photo(100, 5)
+    sha = hashlib.sha256(data).hexdigest()
+    mask_seed.register_public_object(
+        db_session, sha256=sha, kind="mask", mime="image/png", size=len(data),
+        width=100, height=H, storage_key=f"masks/{sha}.png",
+    )  # fmt: skip
+    db_session.commit()
+    near = mask_seed.seed_neighbourhood(db_session, sha=sha, digest=mask_seed.pixel_digest(data))
+    assert (near.image_known, near.copy_known) == (False, False)
+    assert sha in near.keys
+    del store
+
+
+def test_a_seed_from_inputs_computed_ahead_writes_what_a_seed_from_the_bytes_writes(
+    tmp_path: Path,
+) -> None:
+    """The claim's inputs (MASK5) are the seed's own values: seeded from
+    them or from the bytes alone, the same rows and the same objects."""
+    pictures = [_photo(100, 1), _photo(100, 1, note="again"), _photo(104, 2)]
+    outcome: dict[str, Any] = {}
+    for name in ("bytes", "inputs"):
+        engine = _engine(tmp_path / f"{name}.db")
+        store = LocalObjectStore(tmp_path / name)
+        with Session(engine, expire_on_commit=False) as db:
+            for n, data in enumerate(pictures):
+                inputs = None
+                if name == "inputs":
+                    digest = mask_seed.picture_digest(data)
+                    assert digest is not None
+                    near = mask_seed.seed_neighbourhood(
+                        db, sha=hashlib.sha256(data).hexdigest(), digest=digest
+                    )
+                    inputs = mask_seed.seed_inputs(
+                        data, digest, clean=not near.copy_known, phash=not near.image_known
+                    )
+                    assert (inputs.clean is None, inputs.phash is None) == (
+                        n == 1,  # its picture's copy is the first's
+                        False,
+                    )
+                seed_clean_image(
+                    db, store, data, origins=[ImageOrigin(url=ITEM.format(n=n))],
+                    figure_id=f"f{n}", inputs=inputs,
+                )  # fmt: skip
+        outcome[name] = (_canonical(engine), _media(tmp_path / name))
+        engine.dispose()
+    assert outcome["inputs"] == outcome["bytes"]
+
+
+def test_a_seed_whose_inputs_lack_what_it_needs_computes_it(tmp_path: Path) -> None:
+    """A copy the claim saw that is gone by the seed (never, in practice:
+    copies are not deleted), or an original the claim saw recorded: the seed
+    computes what its inputs lack from the bytes, the same values."""
+    data = _photo(100, 9)
+    rows = {}
+    for name, inputs in (
+        ("bytes", None),
+        ("bare", mask_seed.SeedInputs(digest=mask_seed.pixel_digest(data))),
+    ):
+        engine = _engine(tmp_path / f"{name}.db")
+        with Session(engine, expire_on_commit=False) as db:
+            seed_clean_image(
+                db, LocalObjectStore(tmp_path / name), data,
+                origins=[ImageOrigin(url=ITEM.format(n=9))], figure_id="f9", inputs=inputs,
+            )  # fmt: skip
+        rows[name] = (_canonical(engine), _media(tmp_path / name))
+        engine.dispose()
+    assert rows["bare"] == rows["bytes"]

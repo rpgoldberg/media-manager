@@ -7,7 +7,7 @@
         [--busy-windows SPEC] [--residential-ip IP|CIDR | --no-residential-check]
         [--ip-echo-url URL] [--residential-ttl S] [--poll-seconds S]
         [--max-wait-seconds S] [--max-consecutive-failures N] [--raw-dir DIR]
-        [--writers N] [--prefetch N] [--decode-slots N]
+        [--writers N] [--prefetch N] [--decode-slots N] [--cpu-workers N]
     python -m app.cli.mask_batch sql ross-heads --user UUID
     python -m app.cli.mask_batch sql ross-worklist --heads FILE
     python -m app.cli.mask_batch sql catalog-worklist [--shard I/N]
@@ -112,10 +112,28 @@ close kills the kubectl port-forward the live run reaches its database
 through). ``--writers 0`` runs one image at a time on the driver's own
 session, chunk after chunk.
 
+THE CPU STAGES (MASK5). Pipelined, each image's CPU work -- its picture's
+digest read ahead, its clean copy's encode and its original's perceptual
+hash in its claim (only when the database has neither: SHOULD-1), its
+mask's judgment and encode after the model -- runs on ``--cpu-workers``
+processes (app.workers.cpu_stages: forked from a clean fork server, the
+decoded pixels in them at once bounded by size), the same code on the same
+bytes; ``--cpu-workers 0``, and one image at a time, run it on the image's
+own thread. The default is the host's CPUs less two, at most ``--writers``
++ ``--prefetch`` and 16. A worker the pool replaced (one that died) is an
+``app.cpu_pool_replaced`` line.
+
 Exit status: 0 done, 1 done with failures, 2 refused, 3 too many consecutive
 failures, 4 waited longer than ``--max-wait-seconds``, 130 stopped (SIGINT or
 SIGTERM: the image in flight is finished first; pipelined, the images past
-the GPU are, the others are let go unrecorded and come back first).
+the GPU are, the others are let go unrecorded and come back first). Before
+an exit 3 the ``app.circuit_open`` line says why (MASK5): the streak's first
+outage (``cause_exception``, ``cause_message``, ``cause_connection``:
+database, raw_bucket or media_bucket, ``cause_stage``, ``cause_blob_sha256``,
+``cause_at``), its outages by connection and class (``streak_causes``), and
+the last image that got through (``last_success_chunk``,
+``last_success_blob_sha256``, ``last_success_at``); job.end repeats its
+scalars.
 """
 
 from __future__ import annotations
@@ -162,6 +180,13 @@ from ..models import MaskBatch
 from ..object_store import ObjectStore, S3ObjectStore
 from ..telemetry.events import EventLines
 from ..telemetry.tracing import NULL_ITEM, Item
+from ..workers.cpu_stages import (
+    INLINE,
+    MAX_CPU_WORKERS,
+    CpuStages,
+    ProcessStages,
+    default_cpu_workers,
+)
 from ..workers.image_limits import ImageLimitError
 from ..workers.mask_job import (
     finish_mask_batch,
@@ -172,10 +197,13 @@ from ..workers.mask_job import (
 from ..workers.mask_pipeline import Claim, Claims, GpuJob, Held, Slots, on_the_gpu
 from ..workers.mask_policy import ImageOrigin
 from ..workers.mask_seed import (
-    PictureKeys,
-    picture_keys,
+    Neighbourhood,
+    SeedInputs,
+    picture_digest,
     seed_clean_image,
     seed_footprint,
+    seed_inputs,
+    seed_neighbourhood,
     seed_with_retry,
 )
 from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
@@ -811,6 +839,9 @@ class BatchConfig:
     writers: int = 0
     prefetch: int = 4
     decode_slots: int = DECODED_AT_ONCE
+    #: MASK5: the CPU worker processes of a pipelined run (0: its CPU stages
+    #: on its workers' threads, as before; Runtime.cpu_stages makes them)
+    cpu_workers: int = 0
 
 
 @dataclass
@@ -829,6 +860,10 @@ class Runtime:
     #: Each chunk as an item of the run (LG-U11, fc-shared's job model: its own
     #: trace, linked to the run); outside a run, no item.
     open_item: Callable[[int], Item] = lambda _number: NULL_ITEM
+    #: MASK5: a pipelined run's CPU stages on ``cpu_workers`` processes (the
+    #: command line's: app.workers.cpu_stages.ProcessStages); by default, and
+    #: for 0, on the workers' own threads.
+    cpu_stages: Callable[[int], CpuStages] = lambda _workers: INLINE
 
 
 class _Stopped(Exception):
@@ -1009,17 +1044,22 @@ def _mint(
         "reason": None,
     }
 
-    def failed(reason: str, outage: bool = False) -> dict[str, Any]:
+    def failed(
+        reason: str, outage: bool = False, where: str = "", exc: BaseException | None = None
+    ) -> dict[str, Any]:
         # an outage's casualty is 'interrupted': it counts toward the circuit and
         # a plain rerun retries it; an image's own fault stays 'failed'
         status = "interrupted" if outage else "failed"
         record.update(status=status, reason=reason, seconds=round(rt.monotonic() - start, 3))
+        if outage:  # MASK5: why, for the circuit's line (_Tally takes it off the record)
+            cause = _outage_cause(where, exc, reason, now=rt.gates.now())
+            record["cause"] = {**cause, "blob_sha256": item.blob_sha256}
         return record
 
     def raised(where: str, exc: Exception) -> dict[str, Any]:
         if isinstance(exc, ImageLimitError):  # the image's own fault, named by the limit it broke
             return failed(f"refused:{exc.code}")
-        return failed(f"{where}:{type(exc).__name__}", is_outage(exc))
+        return failed(f"{where}:{type(exc).__name__}", is_outage(exc), where, exc)
 
     def rolled_back(where: str, exc: Exception) -> dict[str, Any]:
         with timed(timings, "db"):  # a round trip like any query
@@ -1053,6 +1093,10 @@ def _mint(
         return failed("raw_hash_mismatch")
     if lane is not None:
         lane.before_seed()  # held: nothing of it written, a rerun takes it
+    # pipelined, what its claim computed of the bytes ahead (MASK5: SeedInputs)
+    seed = seed_clean_image
+    if lane is not None and lane.inputs is not None:
+        seed = functools.partial(seed_clean_image, inputs=lane.inputs)
     try:
         # pipelined, its original's and its copy's PUTs run beside its SQL
         with timed(timings, "seed"), media.beside(lane.uploads if lane is not None else None):
@@ -1066,7 +1110,7 @@ def _mint(
                     ImageOrigin(url=item.url, source=item.source, source_class=item.source_class)
                 ],
                 figure_id=item.product_id,
-                seed=seed_clean_image,
+                seed=seed,
             )
         clean_sha = clean.sha256
     except Exception as exc:
@@ -1079,7 +1123,7 @@ def _mint(
             # still racing after the retry: never the image's fault, a rerun takes it
             with timed(timings, "db"):
                 db.rollback()
-            return failed("seed:IntegrityError", outage=True)
+            return failed("seed:IntegrityError", True, "seed", cause)
         return rolled_back("seed", cause)
     record["clean_sha256"] = clean_sha
     mask_start = rt.monotonic()
@@ -1094,6 +1138,8 @@ def _mint(
             timings=timings,
             turn=lane.turn if lane is not None else None,
             slot=lane.decoded if lane is not None else None,
+            # its mask judged on a CPU worker (MASK5); without workers, on this thread as ever
+            cpu=lane.cpu if lane is not None and lane.cpu.workers else None,
         )
     except Exception as exc:
         return rolled_back("settle", exc)
@@ -1104,7 +1150,8 @@ def _mint(
     elif report.status == "failed":
         # the lane caught it and kept the class name; the bucket's error, if any, says more
         witnessed = media.error is not None and is_outage(media.error)
-        failed(str(report.reason), is_outage_reason(report.reason) or witnessed)
+        outage = is_outage_reason(report.reason) or witnessed
+        failed(str(report.reason), outage, "settle", media.error if witnessed else None)
     else:
         record.update(status=report.status, reason=report.reason, mask_sha256=report.mask_sha256)
     record["seconds"] = round(rt.monotonic() - start, 3)
@@ -1119,21 +1166,23 @@ def _mint(
 @dataclass
 class _Fetched:
     """An original read ahead: its bytes or the error reading them, its
-    picture's keys (None when it never reaches the seed), and the seconds
-    each took on the read-ahead thread."""
+    picture's pixel digest (None when it never reaches the seed), and the
+    seconds each took on the read-ahead thread."""
 
     data: bytes | None = None
     error: Exception | None = None
-    keys: PictureKeys | None = None
+    digest: str | None = None
     fetch_seconds: float = 0.0
     keys_seconds: float = 0.0
     #: its width x height from its header (None: it would not open)
     pixels: int | None = None
 
 
-def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
+def _read_ahead(item: WorkItem, rt: Runtime, cpu: CpuStages = INLINE) -> _Fetched:
     """``item``'s original from the raw bucket, decoded and checked against
-    its sha, and its picture's keys, before the image has a worker. An
+    its sha, and its picture's pixel digest (on ``cpu``), before the image
+    has a worker: no more of its keys (MASK5, SHOULD-1: its clean copy is
+    encoded in its claim, only when the picture has no copy yet). An
     original in a codec the lane refuses is never read."""
     assert rt.raw_store is not None
     if item.codec not in ("identity", "gzip"):
@@ -1144,16 +1193,15 @@ def _read_ahead(item: WorkItem, rt: Runtime) -> _Fetched:
     except Exception as exc:
         return _Fetched(error=exc, fetch_seconds=rt.monotonic() - start)
     fetched = rt.monotonic()
-    keys = pixels = None
+    digest = pixels = None
     if hashlib.sha256(data).hexdigest() == item.blob_sha256:
-        # a picture that will not decode fails the seed before it writes a row
-        with contextlib.suppress(Exception):
-            keys = picture_keys(data)
         with contextlib.suppress(Exception), PILImage.open(io.BytesIO(data)) as header:
             pixels = header.width * header.height
+        # a picture that will not decode (None) fails the seed before it writes a row
+        digest = cpu.run(picture_digest, data, pixels=pixels)
     return _Fetched(
         data=data,
-        keys=keys,
+        digest=digest,
         fetch_seconds=fetched - start,
         keys_seconds=rt.monotonic() - fetched,
         pixels=pixels,
@@ -1231,6 +1279,8 @@ class _Flow:
     turn: threading.Lock = field(default_factory=threading.Lock)
     #: the seeds' PUTs, beside their SQL: two an image (its original and copy)
     uploads: ThreadPoolExecutor | None = None
+    #: MASK5: where the images' CPU stages run (a pool of worker processes)
+    cpu: CpuStages = INLINE
 
     def __post_init__(self) -> None:
         self.slots = Slots(self.size)
@@ -1283,30 +1333,39 @@ class _ImageLane:
         self._claim: Claim | None = None
         self._registered = False
         self._turned = False
-        timings.add("claim_keys", fetched.keys_seconds)  # its picture keys, read ahead
+        timings.add("claim_keys", fetched.keys_seconds)  # its picture's digest, read ahead
         self.ahead = fetched.keys_seconds
         self.fetch_seconds = fetched.fetch_seconds
         self.uploads = run.flow.uploads
+        self.cpu = run.flow.cpu
+        #: what its claim computed of its bytes for its seed (None: it will not decode)
+        self.inputs: SeedInputs | None = None
 
     def claim(self, db: Session) -> None:
-        """Before the image's first query: read its footprint
-        (``claim_footprint``, its SQL "db"), register it in work-list order
-        (``claim_register``: the wait for every earlier image to have read
-        its own) and wait for every earlier image it meets (``turn_wait``)."""
+        """Before the image's first query: read its footprint by its
+        original's sha and its picture's digest (``claim_footprint``, its
+        SQL "db"); when the picture has no copy yet, encode the copy its
+        seed will mint (``claim_keys``, on the CPU stages: MASK5, SHOULD-1)
+        and read the footprint of that copy's keys too; register it in
+        work-list order (``claim_register``: the wait for every earlier
+        image to have read its own) and wait for every earlier image it
+        meets (``turn_wait``)."""
         self.before_seed()  # held before it began: not even a query
         with self._timings.stage("claim_footprint"):
             since = self._run.flow.claims.snapshot()
-            shas, digests = {self._item.blob_sha256}, set()
-            keys = self._fetched.keys
-            if keys is not None:
-                shas.add(keys.clean_sha256)
-                digests = {keys.digest, keys.own_digest}
             try:
                 # the image's first query: the pool's checkout (its pre-ping a
                 # round trip no statement event spans) is its "db", as unpipelined
                 with timed(self._timings, "db"):
                     db.connection()
-                footprint = seed_footprint(db, shas=shas, digests=digests)
+                near = seed_neighbourhood(
+                    db, sha=self._item.blob_sha256, digest=self._fetched.digest
+                )
+                footprint = near.keys
+                self.inputs = self._seed_inputs(near)
+                clean = self.inputs.clean if self.inputs is not None else None
+                if clean is not None:  # the copy it will mint: whatever its keys reach
+                    footprint |= seed_footprint(db, shas={clean.sha256}, digests={clean.own_digest})
             except BaseException:
                 self._registered = True
                 self._run.flow.claims.skip(self._index)
@@ -1319,6 +1378,26 @@ class _ImageLane:
         with self._timings.stage("turn_wait"):
             for earlier in waits:
                 earlier.done.wait()
+
+    def _seed_inputs(self, near: Neighbourhood) -> SeedInputs | None:
+        """What the seed will need of the bytes and the database does not
+        have: the clean copy when no copy of the picture is registered, the
+        perceptual hash when the original is not recorded (nothing to
+        compute when both are); None when the picture will not decode."""
+        digest, data = self._fetched.digest, self._fetched.data
+        if digest is None or data is None:
+            return None
+        if near.copy_known and near.image_known:
+            return SeedInputs(digest)
+        with self._timings.stage("claim_keys"):
+            return self.cpu.run(
+                seed_inputs,
+                data,
+                digest,
+                not near.copy_known,
+                not near.image_known,
+                pixels=self._fetched.pixels,
+            )
 
     def fetched(self) -> bytes:
         self._timings.add("fetch", self._fetched.fetch_seconds)
@@ -1388,9 +1467,10 @@ class _Pipeline:
         sql: DatabaseSeconds,
         sessions: sessionmaker[Session],
         interrupted: set[str],
+        cpu: CpuStages = INLINE,
     ) -> None:
         self.rt, self.config, self.backend, self.sql = rt, config, backend, sql
-        self.sessions, self.interrupted = sessions, interrupted
+        self.sessions, self.interrupted, self.cpu = sessions, interrupted, cpu
 
     def roll(
         self,
@@ -1409,7 +1489,9 @@ class _Pipeline:
         image after the next. The held images go back to the front of
         ``remaining``, in work-list order."""
         writers, prefetch, size = self.config.writers, self.config.prefetch, self.config.chunk_size
-        flow = _Flow(events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots)
+        flow = _Flow(
+            events=queue.Queue(maxsize=2 * writers), size=self.config.decode_slots, cpu=self.cpu
+        )
         flow.uploads = ThreadPoolExecutor(max_workers=2 * writers, thread_name_prefix="mask-upload")
         gpu = on_the_gpu(self.backend, flow.submit)
         pool = ThreadPoolExecutor(max_workers=prefetch, thread_name_prefix="mask-read-ahead")
@@ -1435,7 +1517,7 @@ class _Pipeline:
         def read_ahead() -> None:
             for item in itertools.islice(remaining, prefetch):
                 if item.blob_sha256 not in ahead:
-                    ahead[item.blob_sha256] = pool.submit(_read_ahead, item, self.rt)
+                    ahead[item.blob_sha256] = pool.submit(_read_ahead, item, self.rt, self.cpu)
 
         def close_ready() -> None:
             for run in [r for r in runs if r.complete]:
@@ -1468,7 +1550,7 @@ class _Pipeline:
                     item = remaining.popleft()
                     fetched = ahead.pop(item.blob_sha256, None)
                     if fetched is None:
-                        fetched = pool.submit(_read_ahead, item, self.rt)
+                        fetched = pool.submit(_read_ahead, item, self.rt, self.cpu)
                     lanes[started] = (run, item)
                     worker = threading.Thread(
                         # the image's work in its chunk's item (LG-U11): its lines in that trace
@@ -1607,9 +1689,53 @@ def _sized(db: Session, writers: int) -> Session:
     return Session(sized, autoflush=db.autoflush, expire_on_commit=db.expire_on_commit)
 
 
+#: The most characters of an outage's message the circuit's line carries.
+CAUSE_MESSAGE_MAX = 300
+#: The database driver's modules: an outage raised there is the database's.
+_DATABASE_MODULES = ("sqlalchemy", "psycopg2", "psycopg")
+#: The class names the lane records of a database outage it caught.
+_DATABASE_REASONS = frozenset({"OperationalError", "InterfaceError", "IntegrityError"})
+
+
+def _connection(stage: str, exc: BaseException | None, reason: str | None) -> str:
+    """Which connection an outage broke on: ``database`` (the media
+    database, through the operator's tunnel), ``raw_bucket`` (the spine's
+    raw bucket the originals are read from) or ``media_bucket``. By the
+    exception's class first (the database driver's), then by the stage it
+    broke in: the original's read is the raw bucket's, a seed's or a
+    settle's other outage the media bucket's (their PUTs and GETs). With no
+    exception (the lane kept only a class name), by that name, else
+    ``unknown``. The batch reaches no spine API: its raw bucket is the
+    spine's."""
+    if exc is None:
+        return "database" if reason in _DATABASE_REASONS else "unknown"
+    if stage == "db" or type(exc).__module__.split(".")[0] in _DATABASE_MODULES:
+        return "database"
+    return "raw_bucket" if stage == "fetch" else "media_bucket"
+
+
+def _outage_cause(
+    stage: str, exc: BaseException | None, reason: str | None, *, now: dt.datetime
+) -> dict[str, Any]:
+    """One outage, as the circuit's line names it (MASK5): the exception's
+    class (the lane's recorded class name when no exception was seen) and
+    message (one line, at most ``CAUSE_MESSAGE_MAX`` characters; the log
+    line redacts it again), the connection, the stage and when."""
+    message = None if exc is None else " ".join(str(exc).split())[:CAUSE_MESSAGE_MAX]
+    return {
+        "exception": type(exc).__name__ if exc is not None else reason,
+        "message": message,
+        "connection": _connection(stage, exc, reason),
+        "stage": stage,
+        "at": now.isoformat(),
+    }
+
+
 class _Tally:
-    """The batch's running count across chunks: the outage streak and
-    whether the model's own memory is measured since it was loaded."""
+    """The batch's running count across chunks: the outage streak (its first
+    outage, every outage of it by connection and class, and the last image
+    that got through before it: MASK5) and whether the model's own memory
+    is measured since it was loaded."""
 
     def __init__(self, max_consecutive_failures: int) -> None:
         self.max = max_consecutive_failures
@@ -1617,6 +1743,9 @@ class _Tally:
             0  # outage casualties in a row (an image's own fault neither counts nor resets)
         )
         self.measured = False
+        self.cause: dict[str, Any] = {}  # the streak's first outage
+        self.causes: dict[str, int] = {}  # the streak's outages, by connection:class
+        self.last_success: dict[str, Any] = {}  # its chunk, image and when
 
     def take(
         self,
@@ -1627,6 +1756,7 @@ class _Tally:
         stages: dict[str, float],
     ) -> bool:
         """One image's record, in work-list order: True once the circuit opens."""
+        cause = record.pop("cause", None)  # the circuit's line carries it, not the record
         record["chunk"] = chunk.number
         if gpu is not None and not self.measured and record["status"] in _RAN_MODEL:
             gpu.measure_own()
@@ -1635,10 +1765,35 @@ class _Tally:
         chunk.records.append(record)
         chunk.stages.append(stages)
         if record["status"] == "interrupted":
+            cause = cause or {}
+            if not self.streak:
+                self.cause, self.causes = cause, {}
             self.streak += 1
+            key = f"{cause.get('connection', 'unknown')}:{cause.get('exception')}"
+            self.causes[key] = self.causes.get(key, 0) + 1
         elif record["status"] != "failed":
             self.streak = 0
+            self.last_success = {
+                "chunk": chunk.number,
+                "blob_sha256": record["blob_sha256"],
+                "at": rt.gates.now().isoformat(),
+            }
         return self.streak >= self.max
+
+    def circuit(self) -> dict[str, Any]:
+        """Why the circuit opened (MASK5, Ross 11-03): the streak's first
+        outage, its outages by connection and class, the last success."""
+        cause, last = self.cause, self.last_success
+        return {
+            **{f"cause_{key}": cause.get(key) for key in _CAUSE_KEYS},
+            "streak_causes": dict(self.causes),
+            "last_success_chunk": last.get("chunk"),
+            "last_success_blob_sha256": last.get("blob_sha256"),
+            "last_success_at": last.get("at"),
+        }
+
+
+_CAUSE_KEYS = ("exception", "message", "connection", "stage", "blob_sha256", "at")
 
 
 def _one_at_a_time(
@@ -1783,9 +1938,11 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
     gpu = rt.gates.gpu
     # each image's statements, commits and rollbacks as its "db"
     sql = DatabaseSeconds(db, sessions)
-    pipeline = (
-        None if sessions is None else _Pipeline(rt, config, backend, sql, sessions, interrupted)
-    )
+    cpu: CpuStages = INLINE
+    pipeline: _Pipeline | None = None
+    if sessions is not None:
+        cpu = rt.cpu_stages(config.cpu_workers)  # MASK5: its CPU stages' workers
+        pipeline = _Pipeline(rt, config, backend, sql, sessions, interrupted, cpu)
 
     open_items: dict[int, Item] = {}  # the chunks' items not yet ended
 
@@ -1869,6 +2026,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
                         "event": "circuit_open",
                         "consecutive_failures": tally.streak,
                         "interrupted": tally.streak,
+                        **tally.circuit(),  # MASK5: why, before the exit
                     }
                 )
                 return 3
@@ -1882,6 +2040,7 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return 4
     finally:
         sql.close()
+        cpu.close()
         for item in open_items.values():  # a chunk a fault left open
             item.end(error=True)
     rt.emit({"event": "done", "counts": totals, "pending": len(remaining)})
@@ -2203,6 +2362,11 @@ def _run(
         writers=args.writers,
         prefetch=args.prefetch,
         decode_slots=args.decode_slots,
+        cpu_workers=(
+            default_cpu_workers(args.writers, args.prefetch)
+            if args.cpu_workers is None
+            else args.cpu_workers
+        ),
     )
     stop = threading.Event()
     previous: dict[int, Any] = {}
@@ -2245,6 +2409,7 @@ def _run(
         emit=emit,
         stop_requested=stop.is_set,
         open_item=lambda n: run.open_item(name="item.chunk", attributes={"fc.chunk": n}),
+        cpu_stages=lambda workers: _cpu_stages(workers, emit),
     )
     if skipped:
         emit({"event": "worklist", "items": len(items), "skipped_lines": skipped})
@@ -2257,6 +2422,23 @@ def _run(
             engine.dispose()
         for number, handler in previous.items():
             signal.signal(number, handler)
+
+
+#: What the CPU workers' fork server imports: this module, the main module
+#: each worker runs again (app.workers.cpu_stages), and with it the stages'.
+CPU_PRELOAD = ("app.cli.mask_batch",)
+
+
+def _cpu_stages(workers: int, emit: Callable[[dict[str, Any]], None]) -> CpuStages:
+    """The command line's CPU stages: ``workers`` processes (MASK5), each
+    worker the pool replaces said on a line; none, the workers' threads."""
+    if not workers:
+        return INLINE
+    return ProcessStages(
+        workers,
+        on_replaced=lambda why: emit({"event": "cpu_pool_replaced", "detail": why}),
+        preload=CPU_PRELOAD,
+    )
 
 
 def _sql(args: argparse.Namespace) -> int:
@@ -2376,6 +2558,15 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "copies decoded for the model at once, ~0.55 GB each at 4000x3000; a bigger "
             f"original takes one per {DECODE_UNIT_PIXELS} pixels (default {DECODED_AT_ONCE})"
+        ),
+    )
+    run.add_argument(
+        "--cpu-workers",
+        type=_whole(0, MAX_CPU_WORKERS),
+        help=(
+            "worker processes for the pipeline's decodes, encodes and mask judgments (0: on "
+            "the workers' threads; default the host's CPUs less two, at most writers + "
+            f"prefetch and {MAX_CPU_WORKERS})"
         ),
     )
     run.add_argument("--raw-dir", help="read originals from this directory instead of RAW_S3_*")
