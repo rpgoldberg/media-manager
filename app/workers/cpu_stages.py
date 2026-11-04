@@ -33,8 +33,13 @@ at a time, and ``--cpu-workers 0``).
   the batch; each worker raises its own score to the most
   (``WORKER_OOM_SCORE_ADJ``), so the kernel takes a worker instead.
 - A WORKER THAT DIES (the OOM killer, a crash in a decoder) breaks the
-  pool: it is replaced and the call tried again, ``ATTEMPTS`` times in all,
-  each replacement reported (``on_replaced``).
+  pool, and every call in flight on it fails; whose worker died is not
+  told. The pool is replaced (each replacement reported: ``on_replaced``).
+  A call broken beside others is not charged for it: it runs again alone,
+  holding every unit, before any later call. A call broken alone is
+  charged, and its ``ATTEMPTS``-th such break is raised
+  (``BrokenProcessPool``). So a call that kills its worker spends its own
+  tries, never another call's (the MASK5 challenge, SHOULD-2).
 """
 
 from __future__ import annotations
@@ -85,7 +90,8 @@ MAX_CPU_WORKERS = 16
 #: The CPUs left to the driver (the model's thread, its pre- and
 #: post-processing) and the pipeline's own threads.
 RESERVED_CPUS = 2
-#: Tries of one call when its worker dies: the first and two on a new pool.
+#: The breaks a call is charged before its BrokenProcessPool is raised: each
+#: one alone on the pool (a break beside other calls is not charged).
 ATTEMPTS = 3
 #: The modules whose functions the workers run, imported once by the fork
 #: server (a caller adds its own main module's: ``ProcessStages(preload=)``).
@@ -260,17 +266,25 @@ class ProcessStages(CpuStages):
         with self._lock:
             ticket = next(self._tickets)
         self._units.acquire(ticket, units)
+        charged = 0
         try:
-            for attempt in range(1, ATTEMPTS + 1):
+            while True:
                 executor = self._executor
                 assert executor is not None, "a pool made with start=False runs nothing"
                 try:
                     return executor.submit(_call, fn, args).result()
                 except BrokenProcessPool as exc:
                     self._replace(executor, exc)
-                    if attempt == ATTEMPTS:
+                    if units < self._budget:
+                        # beside others: not charged; again alone, by its ticket first
+                        self._units.release(units)
+                        units = 0
+                        self._units.acquire(ticket, self._budget)
+                        units = self._budget
+                        continue
+                    charged += 1
+                    if charged == ATTEMPTS:
                         raise
-            raise AssertionError("unreachable")  # pragma: no cover
         finally:
             self._units.release(units)
 

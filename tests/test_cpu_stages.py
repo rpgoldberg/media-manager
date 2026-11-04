@@ -17,7 +17,7 @@ import os
 import pickle
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -125,8 +125,60 @@ def test_a_call_that_kills_every_worker_is_given_up_after_its_attempts() -> None
     try:
         with pytest.raises(cs.BrokenProcessPool):
             stages.run(_always_die)
-        assert stages.replaced == cs.ATTEMPTS
+        # a unit of the budget: its first break is not charged, its tries alone are
+        assert stages.replaced == 1 + cs.ATTEMPTS
         assert stages.run(_square, 5) == 25  # the next call has a working pool
+    finally:
+        stages.close()
+
+
+def _die_after(seconds: float) -> None:
+    time.sleep(seconds)
+    os._exit(137)
+
+
+def test_a_call_that_kills_its_worker_spends_its_own_tries_never_another_calls() -> None:
+    """The MASK5 challenge (SHOULD-2): a dead worker fails every call in
+    flight on its pool, and whose worker died is not told. A call broken
+    beside others is not charged for it: it runs again alone (every unit),
+    in the order the calls came. A call broken alone is charged; the third
+    time its BrokenProcessPool is raised. So the innocent calls answer, and
+    the one that kills its worker fails alone."""
+    stages = cs.ProcessStages(4)
+    try:
+        results: dict[str, tuple[str, object]] = {}
+
+        def call(name: str, fn: Callable[..., object], *args: object) -> None:
+            try:
+                results[name] = ("ok", stages.run(fn, *args))
+            except Exception as exc:
+                results[name] = ("raised", type(exc).__name__)
+
+        threads = [
+            threading.Thread(target=call, args=(f"innocent{n}", _hold, 0.6)) for n in range(3)
+        ]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.15)  # the three in flight
+        threads.append(threading.Thread(target=call, args=("poison", _die_after, 0.15)))
+        threads[-1].start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert [results[f"innocent{n}"][0] for n in range(3)] == ["ok", "ok", "ok"]
+        assert results["poison"] == ("raised", "BrokenProcessPool")
+        # the break beside the innocent calls, then its own tries alone
+        assert stages.replaced == 1 + cs.ATTEMPTS
+        assert stages.run(_square, 6) == 36  # the pool serves on
+    finally:
+        stages.close()
+
+
+def test_a_call_that_takes_every_unit_is_alone_so_each_break_is_its_own() -> None:
+    stages = cs.ProcessStages(1)
+    try:
+        with pytest.raises(cs.BrokenProcessPool):
+            stages.run(_always_die, pixels=10**9)
+        assert stages.replaced == cs.ATTEMPTS
     finally:
         stages.close()
 
