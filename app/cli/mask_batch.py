@@ -1729,14 +1729,15 @@ def _connection(stage: str, exc: BaseException | None, reason: str | None) -> st
     """Which connection an outage broke on: ``database`` (the media
     database, through the operator's tunnel), ``raw_bucket`` (the spine's
     raw bucket the originals are read from), ``media_bucket``, or
-    ``cpu_pool`` (the batch's own CPU workers, given up on: MASK5). By the
-    exception's class first (the pool's, the database driver's), then by
-    the stage it broke in: the original's read is the raw bucket's, a
-    seed's or a settle's other outage the media bucket's (their PUTs and
-    GETs). With no exception (the lane kept only a class name), by that
-    name, else ``unknown``. The batch reaches no spine API: its raw bucket
-    is the spine's."""
-    if isinstance(exc, BrokenProcessPool) or (exc is None and reason == _POOL_GIVEN_UP):
+    ``cpu_pool`` (the batch's own CPU workers, given up on: MASK5). The
+    claim's CPU stage (``claim_keys``) is the pool's, whatever the class.
+    Else by the exception's class first (the pool's, the database
+    driver's), then by the stage it broke in: the original's read is the
+    raw bucket's, a seed's or a settle's other outage the media bucket's
+    (their PUTs and GETs). With no exception (the lane kept only a class
+    name), by that name, else ``unknown``. The batch reaches no spine API:
+    its raw bucket is the spine's."""
+    if stage == "claim_keys" or isinstance(exc, BrokenProcessPool) or reason == _POOL_GIVEN_UP:
         return "cpu_pool"
     if exc is None:
         return "database" if reason in _DATABASE_REASONS else "unknown"
