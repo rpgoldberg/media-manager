@@ -180,7 +180,6 @@ from ..workers.mask_seed import (
     seed_with_retry,
 )
 from ..workers.matting import (
-    DEFAULT_GPU_MEM_BUDGET_MB,
     BiRefNetMattingBackend,
     IsNetMattingBackend,
     MattingBackend,
@@ -210,22 +209,14 @@ DEFAULT_GPU_SETTLE_SECONDS = 2.0
 DEFAULT_GPU_GROWTH_MAX_MIB = 512
 
 
-#: The most of the card's growth that counts as the batch's own model (MiB).
 #: The most of the card's growth that counts as the batch's own models (MiB):
-#: the total GPU budget (``MASK_GPU_MEM_BUDGET_MB``, split across the sessions'
-#: arena caps) plus 1 GiB for the CUDA contexts and cuDNN workspaces outside
-#: the arenas. Growth beyond it counts as another consumer's. Read at import;
-#: an invalid budget falls back to the default here and is refused at start
-#: (``build_backend``).
-def _own_max_mib() -> int:
-    try:
-        budget = gpu_mem_budget_mb()
-    except ValueError:
-        budget = DEFAULT_GPU_MEM_BUDGET_MB
-    return budget + 1024
-
-
-OWN_MAX_MIB = _own_max_mib()
+#: the empirical bound (BiRefNet 8 GiB + one IS-Net 2 GiB + 512 MiB; measured
+#: growth was ~9,470 MiB with every model loaded). The budget (at least 10,240
+#: MiB) does not move it. It must stay under the card (12,282 MiB less the
+#: desktop's use): a bound at or above it can never be exceeded, and the gate
+#: would never see another consumer. Growth beyond it counts as another
+#: consumer's.
+OWN_MAX_MIB = (8192 + 2048) + 512
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
 #: database session (0: one image at a time, the driver's own session); the

@@ -23,9 +23,9 @@
 #   ENVIRONMENT           required by media-manager's settings (no default): production for the deployed media
 #   DB_POOL_RECYCLE      the pool's recycle seconds when set (-1 through a port-forward: a recycle reconnects
 #                         through the tunnel); media-manager's settings read it, default 1800
-#   MASK_GPU_MEM_BUDGET_MB   the TOTAL GPU memory (MiB, default 12288 = the current caps, minimum 6144) split
-#                         across the model sessions: BiRefNet 2/3 of it, each IS-Net 1/6. The default keeps
-#                         the current caps; lower it only after a live peak measurement
+#   MASK_GPU_MEM_BUDGET_MB   the TOTAL GPU memory (MiB, default 12288 = the current caps, minimum 10240) split across
+#                         the model sessions: BiRefNet keeps 8 GiB, each IS-Net takes half the rest. The
+#                         default keeps the current caps; lower it only after a live peak measurement
 #   MASK_BATCH_NAME       the container name (default mask-batch): one batch at a time; stop it
 #                         with `docker stop -t 120 mask-batch` (it finishes the images past the GPU;
 #                         the others in flight are not recorded and run again first)

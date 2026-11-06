@@ -65,12 +65,18 @@ GPU_MEM_BUDGET_ENV = "MASK_GPU_MEM_BUDGET_MB"
 #: BiRefNet failed at 6 and 7 GiB caps (MASK-BATCH-1), and the 11-05 run reached
 #: 11.2 GB of the 12.3 GB card with these caps.
 DEFAULT_GPU_MEM_BUDGET_MB = 12288
-#: The smallest total (MiB) that loads a model: an IS-Net session runs within
-#: a 1 GiB arena (MASK-BATCH-1), and its share of the budget is 2/12.
-MIN_GPU_MEM_BUDGET_MB = 6144
-#: The sessions the budget is split across, as ``GPU_MEM_LIMIT`` weights: one
-#: BiRefNet (8) and its two IS-Net donors (2 + 2).
-_BUDGET_WEIGHTS_TOTAL = (8 << 30) + 2 * (2 << 30)
+#: BiRefNet's arena floor (bytes): it fails at 6 and 7 GiB caps and runs at 8 GiB
+#: (MASK-BATCH-1), so the budget never gives it less. The budget above this floor
+#: goes to the IS-Net donors, which run within 1 GiB each. A fixed floor, not a
+#: proportional share, keeps the knob useful below 12288 (a share would need the
+#: whole 12288 to reach 8 GiB) while no accepted budget can starve BiRefNet.
+BIREFNET_FLOOR_BYTES = 8 << 30
+#: The IS-Net donors one run loads beside BiRefNet, and the least one needs.
+_DONORS = 2
+_DONOR_MIN_BYTES = 1 << 30
+#: The smallest total (MiB) that loads every model: BiRefNet's floor plus the
+#: donors' minimum (10240).
+MIN_GPU_MEM_BUDGET_MB = (BIREFNET_FLOOR_BYTES + _DONORS * _DONOR_MIN_BYTES) >> 20
 
 
 def gpu_mem_budget_mb() -> int:
@@ -97,8 +103,11 @@ def gpu_mem_budget_mb() -> int:
 
 def gpu_mem_limit(weight: int) -> int:
     """The ``gpu_mem_limit`` (bytes) of a session whose model weighs ``weight``
-    (its class ``GPU_MEM_LIMIT``): its proportional share of the budget."""
-    return (gpu_mem_budget_mb() << 20) * weight // _BUDGET_WEIGHTS_TOTAL
+    (its class ``GPU_MEM_LIMIT``): BiRefNet (a weight of its floor or more) gets
+    ``BIREFNET_FLOOR_BYTES``; each IS-Net donor an equal share of the rest."""
+    if weight >= BIREFNET_FLOOR_BYTES:
+        return BIREFNET_FLOOR_BYTES
+    return ((gpu_mem_budget_mb() << 20) - BIREFNET_FLOOR_BYTES) // _DONORS
 
 
 class MattingBackend(ABC):

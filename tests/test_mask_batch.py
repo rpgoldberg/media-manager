@@ -1404,17 +1404,8 @@ def test_build_backend_reads_the_weights_and_the_device(monkeypatch: pytest.Monk
 def test_build_backend_refuses_an_invalid_gpu_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "100")
     args = mb._parser().parse_args(["run", "--worklist", "w"])
-    with pytest.raises(mb.Refused, match="MASK_GPU_MEM_BUDGET_MB.*6144"):
+    with pytest.raises(mb.Refused, match="MASK_GPU_MEM_BUDGET_MB.*10240"):
         mb.build_backend(args)
-
-
-def test_the_own_bound_falls_back_to_the_default_for_an_invalid_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "junk")
-    assert mb._own_max_mib() == 12288 + 1024
-    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "10000")
-    assert mb._own_max_mib() == 10000 + 1024
 
 
 @pytest.mark.parametrize(("device", "gate_ok"), [("auto", True), ("cuda", False)])
@@ -1581,14 +1572,30 @@ def test_memory_another_process_freed_lowers_the_reference() -> None:
     assert gate.check().ok is False
 
 
+CARD_TOTAL_MIB = 12282  # the RTX 4070 Ti under WSL, as nvidia-smi reports it
+
+
+def test_the_own_bound_can_fire_on_the_real_card() -> None:
+    """GPU1-FIX: a bound at or above the card's own total could never be exceeded
+    by a real reading, so the another-consumer gate would be dead."""
+    assert mb.OWN_MAX_MIB == 8192 + 2048 + 512  # the empirical bound, 10752
+    baseline = 300  # the desktop's own use
+    assert baseline + mb.OWN_MAX_MIB + mb.DEFAULT_GPU_GROWTH_MAX_MIB < CARD_TOTAL_MIB
+
+
 @pytest.mark.parametrize(("excess", "ok"), [(0, True), (512, True), (513, False)])
 def test_own_memory_beyond_the_caps_counts_as_another_consumer(excess: int, ok: bool) -> None:
     """A consumer that started while the model loaded is measured as ours; the
-    models cannot hold more than the GPU budget (12288 MiB default, GPU1-FIX) and ~1 GiB
-    of context overhead, so the rest is someone else's."""
-    assert mb.OWN_MAX_MIB == 12288 + 1024
-    used = 300 + mb.OWN_MAX_MIB + excess
-    readings = iter(["0, 11900, 300, 12282"] + [f"0, {12282 - used}, {used}, 12282"] * 2)
+    models cannot hold more than ``OWN_MAX_MIB`` (the 8 + 2 GiB caps and 0.5 GiB of
+    overhead), so the rest is someone else's. Every reading is one the card can
+    give: used never exceeds its total."""
+    baseline = 300
+    used = baseline + mb.OWN_MAX_MIB + excess
+    assert used <= CARD_TOTAL_MIB
+    readings = iter(
+        [f"0, {CARD_TOTAL_MIB - baseline}, {baseline}, {CARD_TOTAL_MIB}"]
+        + [f"0, {CARD_TOTAL_MIB - used}, {used}, {CARD_TOTAL_MIB}"] * 2
+    )
     gate = mb.GpuGate(query=lambda: next(readings), samples=1, sleep=lambda s: None)
     gate.check()
     gate.mark_loading()

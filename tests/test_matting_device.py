@@ -109,45 +109,58 @@ def test_each_model_has_its_own_gpu_arena_cap() -> None:
     )
 
 
-# GPU1-FIX: one total budget, split across the sessions in proportion to the caps.
+# GPU1-FIX: one total budget; BiRefNet keeps its measured 8 GiB, the donors split the rest.
 
 
-def test_the_default_budget_leaves_the_card_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_default_budget_keeps_the_current_caps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MASK_GPU_MEM_BUDGET_MB", raising=False)
     assert matting.gpu_mem_budget_mb() == 12288
     birefnet = matting.gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT)
     isnet = matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT)
-    assert (birefnet >> 20, isnet >> 20) == (8192, 2048)
-    assert birefnet + 2 * isnet <= 12288 << 20
-    assert abs(birefnet - 4 * isnet) <= 4  # proportional to the 8 GiB : 2 GiB caps (bytes rounded)
+    assert (birefnet, isnet) == (8 << 30, 2 << 30)  # exactly today's 8/2/2 GiB
+    assert birefnet + 2 * isnet == 12288 << 20
 
 
-def test_a_custom_budget_is_split_in_proportion(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "12288")
+def test_a_larger_budget_gives_birefnet_its_floor_and_the_rest_to_the_donors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "14336")
     assert matting.gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT) == 8 << 30
-    assert matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT) == 2 << 30
+    assert matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT) == 3 << 30
     options = IsNetMattingBackend(model_path="/i.onnx").cuda_provider_options()
-    assert options["gpu_mem_limit"] == 2 << 30
+    assert options["gpu_mem_limit"] == 3 << 30
     assert options["arena_extend_strategy"] == "kSameAsRequested"
 
 
-@pytest.mark.parametrize("raw", ["abc", "8.5", "-1", "0", "6143", "1"])
+@pytest.mark.parametrize("raw", ["abc", "8.5", "-1", "0", "6144", "10239", "1"])
 def test_an_invalid_or_too_small_budget_is_refused(
     monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
     monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", raw)
-    with pytest.raises(ValueError, match="MASK_GPU_MEM_BUDGET_MB.*6144"):
+    with pytest.raises(ValueError, match="MASK_GPU_MEM_BUDGET_MB.*10240"):
         matting.gpu_mem_budget_mb()
 
 
-def test_the_minimum_budget_loads_and_blank_is_the_default(
+def test_the_minimum_budget_loads_both_models_and_blank_is_the_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "6144")
-    assert matting.gpu_mem_budget_mb() == 6144
+    """BiRefNet needs 8 GiB (6 and 7 GiB failed, MASK-BATCH-1) and an IS-Net 1 GiB:
+    at the minimum BiRefNet still has its 8 GiB and each donor its 1 GiB."""
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "10240")
+    assert matting.gpu_mem_budget_mb() == 10240
+    assert matting.gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT) == 8 << 30
     assert matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT) == 1 << 30
     monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "  ")
     assert matting.gpu_mem_budget_mb() == 12288
+
+
+@pytest.mark.parametrize("budget", range(10240, 16385, 512))
+def test_no_accepted_budget_starves_birefnet(monkeypatch: pytest.MonkeyPatch, budget: int) -> None:
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", str(budget))
+    birefnet = matting.gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT)
+    isnet = matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT)
+    assert birefnet >= 8 << 30 and isnet >= 1 << 30
+    assert birefnet + 2 * isnet <= budget << 20
 
 
 def test_cuda_refuses_a_session_without_cuda(fake_ort: _FakeOrt) -> None:
