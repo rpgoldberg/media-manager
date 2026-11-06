@@ -85,11 +85,11 @@ def test_cuda_is_the_default_and_asks_for_cuda_first_with_the_pinned_options(
     (session,) = fake_ort.sessions
     assert _names(session) == ["CUDAExecutionProvider", "CPUExecutionProvider"]
     assert session.requested[0] == ("CUDAExecutionProvider", backend.cuda_provider_options())
-    # GPU1-FIX: the limit is BiRefNet's share of the default 8800 MiB budget
+    # GPU1-FIX: the limit is BiRefNet's share of the default 12288 MiB budget (today's 8/2/2 GiB caps)
     # (8/12), no longer a fixed 8 GiB
     assert backend.cuda_provider_options() == {
         **CUDA_PROVIDER_OPTIONS,
-        "gpu_mem_limit": (8800 << 20) * 8 // 12,
+        "gpu_mem_limit": (12288 << 20) * 8 // 12,
     }
     assert CUDA_PROVIDER_OPTIONS["device_id"] == 0
     assert CUDA_PROVIDER_OPTIONS["arena_extend_strategy"] == "kSameAsRequested"
@@ -105,7 +105,7 @@ def test_each_model_has_its_own_gpu_arena_cap() -> None:
     assert IsNetMattingBackend.GPU_MEM_LIMIT == 2 << 30
     assert (
         IsNetMattingBackend(model_path="/i.onnx").cuda_provider_options()["gpu_mem_limit"]
-        == (8800 << 20) * 2 // 12
+        == (12288 << 20) * 2 // 12
     )
 
 
@@ -114,11 +114,11 @@ def test_each_model_has_its_own_gpu_arena_cap() -> None:
 
 def test_the_default_budget_leaves_the_card_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MASK_GPU_MEM_BUDGET_MB", raising=False)
-    assert matting.gpu_mem_budget_mb() == 8800
+    assert matting.gpu_mem_budget_mb() == 12288
     birefnet = matting.gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT)
     isnet = matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT)
-    assert (birefnet >> 20, isnet >> 20) == (5866, 1466)
-    assert birefnet + 2 * isnet <= 8800 << 20
+    assert (birefnet >> 20, isnet >> 20) == (8192, 2048)
+    assert birefnet + 2 * isnet <= 12288 << 20
     assert abs(birefnet - 4 * isnet) <= 4  # proportional to the 8 GiB : 2 GiB caps (bytes rounded)
 
 
@@ -147,7 +147,7 @@ def test_the_minimum_budget_loads_and_blank_is_the_default(
     assert matting.gpu_mem_budget_mb() == 6144
     assert matting.gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT) == 1 << 30
     monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "  ")
-    assert matting.gpu_mem_budget_mb() == 8800
+    assert matting.gpu_mem_budget_mb() == 12288
 
 
 def test_cuda_refuses_a_session_without_cuda(fake_ort: _FakeOrt) -> None:

@@ -60,9 +60,11 @@ CUDA_PROVIDER_OPTIONS: dict[str, Any] = {
 #: The env var holding the TOTAL GPU memory budget (MiB) for every session the
 #: batch loads together; each session's ``gpu_mem_limit`` is its share.
 GPU_MEM_BUDGET_ENV = "MASK_GPU_MEM_BUDGET_MB"
-#: The default total (MiB): the 12.3 GB WSL card less ~3.5 GB for the other GPU
-#: users (the 11-05 run reached 11.2 GB with caps summing to 12 GiB).
-DEFAULT_GPU_MEM_BUDGET_MB = 8800
+#: The default total (MiB): 12 GiB, which splits into today's 8/2/2 GiB caps, so
+#: the default changes no limit. Lower it only after a live peak measurement:
+#: BiRefNet failed at 6 and 7 GiB caps (MASK-BATCH-1), and the 11-05 run reached
+#: 11.2 GB of the 12.3 GB card with these caps.
+DEFAULT_GPU_MEM_BUDGET_MB = 12288
 #: The smallest total (MiB) that loads a model: an IS-Net session runs within
 #: a 1 GiB arena (MASK-BATCH-1), and its share of the budget is 2/12.
 MIN_GPU_MEM_BUDGET_MB = 6144
