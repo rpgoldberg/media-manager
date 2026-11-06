@@ -1401,6 +1401,22 @@ def test_build_backend_reads_the_weights_and_the_device(monkeypatch: pytest.Monk
     assert (backend.primary.device, backend.primary.cpu_threads) == ("auto", 2)
 
 
+def test_build_backend_refuses_an_invalid_gpu_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "100")
+    args = mb._parser().parse_args(["run", "--worklist", "w"])
+    with pytest.raises(mb.Refused, match="MASK_GPU_MEM_BUDGET_MB.*6144"):
+        mb.build_backend(args)
+
+
+def test_the_own_bound_falls_back_to_the_default_for_an_invalid_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "junk")
+    assert mb._own_max_mib() == 8800 + 1024
+    monkeypatch.setenv("MASK_GPU_MEM_BUDGET_MB", "10000")
+    assert mb._own_max_mib() == 10000 + 1024
+
+
 @pytest.mark.parametrize(("device", "gate_ok"), [("auto", True), ("cuda", False)])
 def test_main_wires_the_gpu_less_pass_to_device_auto_only(
     tmp_path: Path,
@@ -1568,9 +1584,9 @@ def test_memory_another_process_freed_lowers_the_reference() -> None:
 @pytest.mark.parametrize(("excess", "ok"), [(0, True), (512, True), (513, False)])
 def test_own_memory_beyond_the_caps_counts_as_another_consumer(excess: int, ok: bool) -> None:
     """A consumer that started while the model loaded is measured as ours; the
-    model cannot hold more than its arena caps (8 + 2 GiB) and ~0.5 GiB of
-    overhead, so the rest is someone else's."""
-    assert mb.OWN_MAX_MIB == 8192 + 2048 + 512
+    models cannot hold more than the GPU budget (8800 MiB, GPU1-FIX) and ~1 GiB
+    of context overhead, so the rest is someone else's."""
+    assert mb.OWN_MAX_MIB == 8800 + 1024
     used = 300 + mb.OWN_MAX_MIB + excess
     readings = iter(["0, 11900, 300, 12282"] + [f"0, {12282 - used}, {used}, 12282"] * 2)
     gate = mb.GpuGate(query=lambda: next(readings), samples=1, sleep=lambda s: None)

@@ -179,7 +179,14 @@ from ..workers.mask_seed import (
     seed_footprint,
     seed_with_retry,
 )
-from ..workers.matting import BiRefNetMattingBackend, IsNetMattingBackend, MattingBackend
+from ..workers.matting import (
+    DEFAULT_GPU_MEM_BUDGET_MB,
+    BiRefNetMattingBackend,
+    IsNetMattingBackend,
+    MattingBackend,
+    gpu_mem_budget_mb,
+    gpu_mem_limit,
+)
 from ..workers.raw_source import (
     RawStoreConfigError,
     ReadOnlyStore,
@@ -201,15 +208,24 @@ DEFAULT_GPU_FREE_MIN_MIB = 9 * 1024
 DEFAULT_GPU_SETTLE_SECONDS = 2.0
 #: ...and the growth of the card's used memory (MiB) that means another consumer.
 DEFAULT_GPU_GROWTH_MAX_MIB = 512
+
+
 #: The most of the card's growth that counts as the batch's own model (MiB).
-#: Measured on the RTX 4070 Ti: ~9,470 MiB (9.27-9.48 GiB) with BiRefNet plus its
-#: two IS-Net donors loaded. The caps are far higher (BiRefNet 8 GiB + two IS-Net
-#: 2 GiB each = 12 GiB), so this is an empirical bound (8 GiB + 2 GiB + 512 MiB,
-#: ~1.3 GB over the measurement), not the sum of the caps; growth beyond it counts
-#: as another consumer's.
-OWN_MAX_MIB = (
-    (BiRefNetMattingBackend.GPU_MEM_LIMIT + IsNetMattingBackend.GPU_MEM_LIMIT) >> 20
-) + 512
+#: The most of the card's growth that counts as the batch's own models (MiB):
+#: the total GPU budget (``MASK_GPU_MEM_BUDGET_MB``, split across the sessions'
+#: arena caps) plus 1 GiB for the CUDA contexts and cuDNN workspaces outside
+#: the arenas. Growth beyond it counts as another consumer's. Read at import;
+#: an invalid budget falls back to the default here and is refused at start
+#: (``build_backend``).
+def _own_max_mib() -> int:
+    try:
+        budget = gpu_mem_budget_mb()
+    except ValueError:
+        budget = DEFAULT_GPU_MEM_BUDGET_MB
+    return budget + 1024
+
+
+OWN_MAX_MIB = _own_max_mib()
 DEFAULT_IP_ECHO_URL = "https://api.ipify.org"
 #: MASK-PERF-2: the images a chunk runs at once, each on a worker with its own
 #: database session (0: one image at a time, the driver's own session); the
@@ -1760,6 +1776,14 @@ def run_batch(items: Sequence[WorkItem], config: BatchConfig, rt: Runtime) -> in
         return _plan(pending, config, rt)
 
     backend = rt.make_backend()
+    rt.emit(
+        {
+            "event": "gpu_budget",
+            "budget_mib": gpu_mem_budget_mb(),
+            "birefnet_limit_mib": gpu_mem_limit(BiRefNetMattingBackend.GPU_MEM_LIMIT) >> 20,
+            "isnet_limit_mib": gpu_mem_limit(IsNetMattingBackend.GPU_MEM_LIMIT) >> 20,
+        }
+    )
     if not backend.publishes_masks:
         rt.emit({"event": "refused", "detail": f"backend {backend.name!r} is not a mask model"})
         return 2
@@ -2100,6 +2124,10 @@ class Refused(Exception):
 def build_backend(args: argparse.Namespace) -> MattingBackend:
     from .masks import make_backend
 
+    try:
+        gpu_mem_budget_mb()
+    except ValueError as exc:
+        raise Refused(str(exc)) from exc
     backend = make_backend(
         args.backend, None, None, None, device=args.device, cpu_threads=args.cpu_threads
     )

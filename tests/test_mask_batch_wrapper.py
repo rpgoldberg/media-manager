@@ -213,3 +213,15 @@ def test_an_explicit_container_memory_wins(tmp_path: Path, args: tuple[str, ...]
     )
     assert done.returncode == 0, done.stderr
     assert _memory(argv) == "12g"
+
+
+def test_the_gpu_memory_budget_is_passed_by_name(tmp_path: Path) -> None:
+    done, argv = _run(
+        tmp_path,
+        str(tmp_path / "state"),
+        MASK_BATCH_IMAGE="worker@sha256:abc",
+        MASK_GPU_MEM_BUDGET_MB="7000",
+    )
+    assert done.returncode == 0, done.stderr
+    assert "MASK_GPU_MEM_BUDGET_MB" in argv
+    assert "7000" not in " ".join(argv)  # by name, never by value

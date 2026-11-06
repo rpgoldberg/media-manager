@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -47,8 +48,55 @@ logger = logging.getLogger(__name__)
 MATTING_DEVICES = ("cuda", "auto", "cpu")
 
 #: The CUDA execution provider options every GPU session shares; each model
-#: adds its own arena cap (``GPU_MEM_LIMIT``).
-CUDA_PROVIDER_OPTIONS: dict[str, Any] = {"device_id": 0}
+#: adds its own arena cap (``gpu_mem_limit``, its share of the total budget).
+#: ``kSameAsRequested`` grows an arena by the size asked for, not by doubling
+#: (onnxruntime's default ``kNextPowerOfTwo``), so an arena stops at what the
+#: model needs instead of rounding up to the next power of two.
+CUDA_PROVIDER_OPTIONS: dict[str, Any] = {
+    "device_id": 0,
+    "arena_extend_strategy": "kSameAsRequested",
+}
+
+#: The env var holding the TOTAL GPU memory budget (MiB) for every session the
+#: batch loads together; each session's ``gpu_mem_limit`` is its share.
+GPU_MEM_BUDGET_ENV = "MASK_GPU_MEM_BUDGET_MB"
+#: The default total (MiB): the 12.3 GB WSL card less ~3.5 GB for the other GPU
+#: users (the 11-05 run reached 11.2 GB with caps summing to 12 GiB).
+DEFAULT_GPU_MEM_BUDGET_MB = 8800
+#: The smallest total (MiB) that loads a model: an IS-Net session runs within
+#: a 1 GiB arena (MASK-BATCH-1), and its share of the budget is 2/12.
+MIN_GPU_MEM_BUDGET_MB = 6144
+#: The sessions the budget is split across, as ``GPU_MEM_LIMIT`` weights: one
+#: BiRefNet (8) and its two IS-Net donors (2 + 2).
+_BUDGET_WEIGHTS_TOTAL = (8 << 30) + 2 * (2 << 30)
+
+
+def gpu_mem_budget_mb() -> int:
+    """The total GPU budget in MiB from ``MASK_GPU_MEM_BUDGET_MB`` (default
+    ``DEFAULT_GPU_MEM_BUDGET_MB``); ValueError if it is not a whole number, is
+    not positive, or is below ``MIN_GPU_MEM_BUDGET_MB``."""
+    raw = os.environ.get(GPU_MEM_BUDGET_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_GPU_MEM_BUDGET_MB
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{GPU_MEM_BUDGET_ENV}={raw!r} is not a whole number of MiB "
+            f"(minimum {MIN_GPU_MEM_BUDGET_MB})"
+        ) from None
+    if value <= 0 or value < MIN_GPU_MEM_BUDGET_MB:
+        raise ValueError(
+            f"{GPU_MEM_BUDGET_ENV}={value} is too small to load a model: "
+            f"minimum {MIN_GPU_MEM_BUDGET_MB} MiB"
+        )
+    return value
+
+
+def gpu_mem_limit(weight: int) -> int:
+    """The ``gpu_mem_limit`` (bytes) of a session whose model weighs ``weight``
+    (its class ``GPU_MEM_LIMIT``): its proportional share of the budget."""
+    return (gpu_mem_budget_mb() << 20) * weight // _BUDGET_WEIGHTS_TOTAL
 
 
 class MattingBackend(ABC):
@@ -197,7 +245,8 @@ class BiRefNetMattingBackend(MattingBackend):
     #: MASK-BATCH-1): unbounded, BiRefNet's arena grows to the whole card and
     #: the base-keep pass spills into shared memory (~5.5 s per image instead
     #: of ~0.7 s); a 6 or 7 GiB cap fails (one decoder tensor is 784 MiB);
-    #: 8 GiB runs, with the same masks as unbounded.
+    #: 8 GiB runs, with the same masks as unbounded. Now the model's WEIGHT in
+    #: the split of ``MASK_GPU_MEM_BUDGET_MB`` (its limit is 8/12 of it).
     GPU_MEM_LIMIT: ClassVar[int] = 8 << 30
     #: ImageNet normalization stats used by the model's own preprocessor.
     MEAN = (0.485, 0.456, 0.406)
@@ -230,7 +279,7 @@ class BiRefNetMattingBackend(MattingBackend):
 
     def cuda_provider_options(self) -> dict[str, Any]:
         """This model's CUDA execution provider options."""
-        return {**CUDA_PROVIDER_OPTIONS, "gpu_mem_limit": self.GPU_MEM_LIMIT}
+        return {**CUDA_PROVIDER_OPTIONS, "gpu_mem_limit": gpu_mem_limit(self.GPU_MEM_LIMIT)}
 
     def load(self) -> None:
         self._get_session()
@@ -418,7 +467,8 @@ class IsNetMattingBackend(BiRefNetMattingBackend):
 
     name: ClassVar[str] = "isnet"
     #: Measured (MASK-BATCH-1): an IS-Net session runs within a 1 GiB arena;
-    #: 2 GiB leaves room, and adds nothing to the measured peak.
+    #: 2 GiB leaves room, and adds nothing to the measured peak. Its weight in
+    #: the budget split (each session is 2/12 of ``MASK_GPU_MEM_BUDGET_MB``).
     GPU_MEM_LIMIT: ClassVar[int] = 2 << 30
 
     def _preprocess(self, image: Image.Image) -> np.ndarray:
